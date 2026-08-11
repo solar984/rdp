@@ -1,0 +1,12 @@
+# Visual Studio workspace state
+.vs/
+
+# CMake build trees
+build/
+build-*/
+out/
+cmake-build-*/
+
+# Developer-specific CMake configuration
+CMakeSettings.json
+CMakeUserPresets.json

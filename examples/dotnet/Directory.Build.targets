@@ -1,0 +1,15 @@
+<Project>
+  <PropertyGroup>
+    <RdplibNativePath Condition="'$(RdplibNativePath)' == '' and $([MSBuild]::IsOSPlatform('Windows')) and Exists('$(MSBuildThisFileDirectory)native/rdplib.dll')">$(MSBuildThisFileDirectory)native/rdplib.dll</RdplibNativePath>
+    <RdplibNativePath Condition="'$(RdplibNativePath)' == '' and $([MSBuild]::IsOSPlatform('Linux')) and Exists('$(MSBuildThisFileDirectory)native/librdplib.so')">$(MSBuildThisFileDirectory)native/librdplib.so</RdplibNativePath>
+    <RdplibNativePath Condition="'$(RdplibNativePath)' == '' and $([MSBuild]::IsOSPlatform('OSX')) and Exists('$(MSBuildThisFileDirectory)native/librdplib.dylib')">$(MSBuildThisFileDirectory)native/librdplib.dylib</RdplibNativePath>
+  </PropertyGroup>
+
+  <ItemGroup Condition="'$(RdplibNativePath)' != '' and Exists('$(RdplibNativePath)')">
+    <None Include="$(RdplibNativePath)" Link="%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <Target Name="ValidateRdplibNativeLibrary" BeforeTargets="PrepareForBuild" Condition="'$(DesignTimeBuild)' != 'true' and ('$(RdplibNativePath)' == '' or !Exists('$(RdplibNativePath)'))">
+    <Error Text="Build the shared rdplib library and copy it into examples/dotnet/native, or set RdplibNativePath to its full path. See examples/dotnet/native/README.md." />
+  </Target>
+</Project>

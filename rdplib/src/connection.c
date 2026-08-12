@@ -6,6 +6,7 @@
 #include "rdp.h"
 #include "rdplib_constants.h"
 #include "trace.h"
+#include "rdplib_wire.h"
 
 #include <string.h>
 
@@ -516,17 +517,15 @@ rdp_rx_arrival_disposition_t connection_parse_and_validate_arrival(connection_t 
 #ifndef RDPLIB_SOURCE_FAITHFUL
     uint32_t required_bytes;
     uint32_t fragment_offset = 0;
-    uint16_t network_flags;
     uint16_t flags;
     uint16_t acknowledgement_base_flags;
 
-    if (!connection || !packet || !header || packet_bytes < sizeof(network_flags))
+    if (!connection || !packet || !header || packet_bytes < sizeof(uint16_t))
     {
         return RDP_RX_ABORT;
     }
 
-    memcpy(&network_flags, packet, sizeof(network_flags));
-    flags = ntohs(network_flags);
+    flags = rdplib_load_network_u16(packet);
     if (((flags & (RDP_FLAG_SYN | RDP_FLAG_FIN | RDP_FLAG_FRAGMENT)) == 0 || (flags & RDP_FLAG_MSGID) != 0) && (flags & RDP_FLAG_MULTI) == 0)
     {
         required_bytes = 4;
@@ -559,11 +558,9 @@ rdp_rx_arrival_disposition_t connection_parse_and_validate_arrival(connection_t 
         }
         if (fragment_offset)
         {
-            uint16_t network_fragment_count;
             uint32_t payload_bytes = packet_bytes - required_bytes;
 
-            memcpy(&network_fragment_count, packet + fragment_offset + 4u, sizeof(network_fragment_count));
-            if (ntohs(network_fragment_count) > 100u || payload_bytes < 1u || payload_bytes > RDP_FRAGMENT_PAYLOAD_BYTES)
+            if (rdplib_load_network_u16(packet + fragment_offset + 4u) > 100u || payload_bytes < 1u || payload_bytes > RDP_FRAGMENT_PAYLOAD_BYTES)
             {
                 return rdplib_connection_abort_invalid_fragment(connection);
             }
@@ -578,7 +575,7 @@ rdp_rx_arrival_disposition_t connection_parse_and_validate_arrival(connection_t 
     uint32_t acknowledgement_bytes;
     uint16_t required_message_id_flags;
 
-    header->flags = ntohs(*(const uint16_t *)cursor);
+    header->flags = rdplib_load_network_u16(cursor);
     cursor += 2;
     required_message_id_flags = header->flags & (RDP_FLAG_SYN | RDP_FLAG_FIN | RDP_FLAG_FRAGMENT);
     if ((required_message_id_flags && (header->flags & RDP_FLAG_MSGID) == 0) || (header->flags & RDP_FLAG_MULTI) != 0)
@@ -589,7 +586,7 @@ rdp_rx_arrival_disposition_t connection_parse_and_validate_arrival(connection_t 
         goto finished;
     }
 
-    header->sequence = ntohs(*(const uint16_t *)cursor);
+    header->sequence = rdplib_load_network_u16(cursor);
     cursor += 2;
     disposition = rx_validate_seqnum_arrival(connection, header->sequence);
     if (disposition != RDP_RX_ACCEPT)
@@ -607,7 +604,7 @@ rdp_rx_arrival_disposition_t connection_parse_and_validate_arrival(connection_t 
 
     if ((header->flags & RDP_FLAG_MSGID) != 0)
     {
-        header->message_id = ntohs(*(const uint16_t *)cursor);
+        header->message_id = rdplib_load_network_u16(cursor);
         cursor += 2;
         disposition = rx_validate_msgid_arrival(connection, header);
         if (disposition != RDP_RX_ACCEPT)
@@ -621,9 +618,9 @@ rdp_rx_arrival_disposition_t connection_parse_and_validate_arrival(connection_t 
     header->fragment_count = 1;
     if ((header->flags & RDP_FLAG_FRAGMENT) != 0)
     {
-        header->fragment_id = ntohs(*(const uint16_t *)cursor);
-        header->fragment_index = ntohs(*(const uint16_t *)(cursor + 2));
-        header->fragment_count = ntohs(*(const uint16_t *)(cursor + 4));
+        header->fragment_id = rdplib_load_network_u16(cursor);
+        header->fragment_index = rdplib_load_network_u16(cursor + 2);
+        header->fragment_count = rdplib_load_network_u16(cursor + 4);
         cursor += 6;
     }
 

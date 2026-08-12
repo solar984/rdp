@@ -13,6 +13,7 @@
 #include "fast.h"
 #include "framing.h"
 #include "net_error.h"
+#include "rdplib_wire.h"
 
 enum
 {
@@ -33,14 +34,9 @@ static uint16_t load_native_u16(const uint8_t *bytes)
     return value;
 }
 
-static uint16_t load_network_u16(const uint8_t *bytes)
-{
-    return (uint16_t)((uint16_t)bytes[0] << 8 | bytes[1]);
-}
-
 static int format_ipv4(char *output, const uint8_t address[16])
 {
-    return sprintf(output, "AF_INET %u.%u.%u.%u:%u", address[4], address[5], address[6], address[7], load_network_u16(address + 2));
+    return sprintf(output, "AF_INET %u.%u.%u.%u:%u", address[4], address[5], address[6], address[7], rdplib_load_network_u16(address + 2));
 }
 
 int rdp_format_sockaddr_mac(char *output, const uint8_t address[16])

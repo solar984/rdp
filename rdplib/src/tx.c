@@ -20,6 +20,7 @@
 #include "serial.h"
 #include "trace.h"
 #include "usend.h"
+#include "rdplib_wire.h"
 
 enum
 {
@@ -755,7 +756,7 @@ static int rdplib_tx_ack_claims_are_retired_or_sent(const connection_t *connecti
         return 1;
     }
 
-    base_message_id = ntohs(*(const uint16_t *)header->ack_data);
+    base_message_id = rdplib_load_network_u16(header->ack_data);
     mask = header->ack_data + 2;
     mask_bits = ((header->flags & RDP_FLAG_ACK_MASK_LENGTH) >> 4) * 8u;
 
@@ -817,7 +818,7 @@ rdp_rx_arrival_disposition_t tx_validate_ack_arrival(connection_t *connection, c
         return RDP_RX_ACCEPT;
     }
 
-    base_message_id = ntohs(*(const uint16_t *)header->ack_data);
+    base_message_id = rdplib_load_network_u16(header->ack_data);
     highest_message_id = base_message_id;
     *field_bytes = 2u + mask_bytes;
     if (mask_bytes)
@@ -895,7 +896,7 @@ void tx_record_ack_arrival(connection_t *connection, const _rdp_header_t *header
         uint16_t old_acknowledged_through = state->acknowledged_through_message_id;
         int32_t advance;
 
-        base_message_id = ntohs(*(const uint16_t *)mask);
+        base_message_id = rdplib_load_network_u16(mask);
         mask += 2;
 #ifdef RDPLIB_SOURCE_FAITHFUL
         ack_text_cursor += sprintf(ack_text_cursor, "ackthru [%u", base_message_id);
@@ -933,7 +934,7 @@ void tx_record_ack_arrival(connection_t *connection, const _rdp_header_t *header
     }
     else if ((flags & RDP_FLAG_MASKOFFSET) != 0)
     {
-        base_message_id = ntohs(*(const uint16_t *)mask);
+        base_message_id = rdplib_load_network_u16(mask);
         mask += 2;
 #ifdef RDPLIB_SOURCE_FAITHFUL
         ack_text_cursor += sprintf(ack_text_cursor, "maskoffset [%u", base_message_id);

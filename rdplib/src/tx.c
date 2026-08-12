@@ -1042,7 +1042,8 @@ void tx_get_event_time(connection_t *connection, rdp_timeout_data_t *timeout)
     }
 
 #ifndef RDPLIB_SOURCE_FAITHFUL
-    // An unreliable message cannot establish SYN.  Leave it queued until a reliable send or keepalive gives this direction an initial reliable ID.
+    // An unreliable message cannot establish SYN. Leave it queued until the
+    // first reliable message gives this direction an initial reliable ID.
     if (ready_head && !state->syn_acknowledged && !sent_head && !state->delayed_ack_pending)
     {
         return;

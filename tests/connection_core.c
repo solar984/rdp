@@ -40,6 +40,15 @@ static void test_event_selection(void)
     connection.receive.recording.last_reliable_receive_time_ms = 1;
     connection.transmit.last_reliable_enqueue_time_ms = 100;
 
+    // Receiving reliable traffic does not establish the opposite transmit
+    // direction. Keepalive starts only after this direction has sent SYN on
+    // its first reliable message.
+    connection_recalc_event_timeout(&connection, &timeout);
+    assert(timeout.infinite);
+    assert(connection.event_type == RDP_CONNECTION_EVENT_NONE);
+
+    connection.receive.recording.last_reliable_receive_time_ms = 0;
+    connection.transmit.syn_sent = 1;
     connection_recalc_event_timeout(&connection, &timeout);
     assert(!timeout.infinite);
     assert(timeout.deadline_ms == 10100);

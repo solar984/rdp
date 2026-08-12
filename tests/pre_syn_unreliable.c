@@ -71,22 +71,29 @@ int main(void)
     server_connection = rdplib_endpoint_accept(server);
     assert(server_connection != NULL);
     message = rdplib_connection_pop_message(server_connection);
-    check_payload(message, request, sizeof(request), RDP_FLAG_MSGID | RDP_FLAG_SEQUENCED, 0);
+    check_payload(message, request, sizeof(request), RDP_FLAG_SYN | RDP_FLAG_MSGID | RDP_FLAG_SEQUENCED, RDP_FLAG_SYSTEM);
 
     assert(rdplib_connection_send(server_connection, queued_unreliable, sizeof(queued_unreliable), 1, RDPLIB_SEND_UNRELIABLE) == RDPLIB_OK);
-    assert(rdplib_endpoint_process(client, 100) >= 0);
-    assert(rdplib_connection_pop_message(client_connection) == NULL);
+    assert(rdplib_connection_enable_keepalive_with_interval(server_connection, 20) == RDPLIB_OK);
+    for (attempts = 0; attempts < 4; ++attempts)
+    {
+        assert(rdplib_endpoint_process(client, 100) >= 0);
+        assert(rdplib_connection_pop_message(client_connection) == NULL);
+    }
+    assert(rdplib_connection_enable_keepalive_with_interval(server_connection, RDPLIB_DEFAULT_KEEPALIVE_INTERVAL_MS) == RDPLIB_OK);
 
-    // This reliable send establishes the initial ID for the server to client direction.  It must not block behind the earlier unreliable packet.
+    // Neither the unreliable message nor keepalive can establish this
+    // direction. The first reliable application message carries SYN and must
+    // not block behind the earlier unreliable message.
     assert(rdplib_connection_send(server_connection, reliable_bootstrap, sizeof(reliable_bootstrap), 1, RDPLIB_SEND_RELIABLE) == RDPLIB_OK);
     message = wait_for_message(client, client_connection);
-    check_payload(message, reliable_bootstrap, sizeof(reliable_bootstrap), RDP_FLAG_MSGID | RDP_FLAG_SEQUENCED, 0);
+    check_payload(message, reliable_bootstrap, sizeof(reliable_bootstrap), RDP_FLAG_SYN | RDP_FLAG_MSGID | RDP_FLAG_SEQUENCED, RDP_FLAG_SYSTEM);
     message = wait_for_message(client, client_connection);
-    check_payload(message, queued_unreliable, sizeof(queued_unreliable), RDP_FLAG_SEQUENCED, RDP_FLAG_MSGID);
+    check_payload(message, queued_unreliable, sizeof(queued_unreliable), RDP_FLAG_SEQUENCED, RDP_FLAG_SYN | RDP_FLAG_MSGID | RDP_FLAG_SYSTEM);
 
     assert(rdplib_connection_send(server_connection, live_unreliable, sizeof(live_unreliable), 1, RDPLIB_SEND_UNRELIABLE) == RDPLIB_OK);
     message = wait_for_message(client, client_connection);
-    check_payload(message, live_unreliable, sizeof(live_unreliable), RDP_FLAG_SEQUENCED, RDP_FLAG_MSGID);
+    check_payload(message, live_unreliable, sizeof(live_unreliable), RDP_FLAG_SEQUENCED, RDP_FLAG_SYN | RDP_FLAG_MSGID | RDP_FLAG_SYSTEM);
 
     assert(rdplib_connection_begin_close(client_connection, 1000) == RDPLIB_OK);
     for (attempts = 0; attempts < 10 && !saw_fin; ++attempts)

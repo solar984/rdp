@@ -228,7 +228,7 @@ int rdplib_connect(
 
 Creates an outgoing connection to an IPv4 host.  This does not necessarily send anything immediately.
 
-The first reliable transport message carries SYN.  This is normally an application message or keepalive.  It can also be FIN if the connection is closed before anything else is sent.
+The first reliable transport message carries SYN.  This is normally an application message.  It can also be FIN if the connection is closed before anything else is sent.  Keepalive does not become eligible until the direction has already sent SYN.
 
 Configure keepalive, data rate, and send buffer size after connecting.
 
@@ -272,6 +272,8 @@ Enables reliable keepalives for the rest of the connection.  Calls may be repeat
 
 The interval starts at `RDPLIB_DEFAULT_KEEPALIVE_INTERVAL_MS`, which is 10,000 ms.  If a custom interval was already set, this function does not replace it.
 
+Keepalive starts only after this transmit direction has sent SYN on its first reliable message.  It does not establish an otherwise idle direction.
+
 Returns `RDPLIB_OK`, `RDPLIB_ERROR_INVALID_ARGUMENT`, or `RDPLIB_ERROR_NOT_USABLE`.  The application keeps ownership of the connection.
 
 ### `rdplib_connection_enable_keepalive_with_interval`
@@ -285,6 +287,8 @@ int rdplib_connection_enable_keepalive_with_interval(
 Sets and enables a per connection keepalive interval.  It accepts 1 through `INT32_MAX` milliseconds.
 
 The deadline is measured from the last reliable enqueue.  Shortening the interval can make a keepalive due immediately.
+
+Keepalive starts only after this transmit direction has sent SYN on its first reliable message.  It does not establish an otherwise idle direction.
 
 The source faithful build does not have this option.  It returns `RDPLIB_ERROR_NOT_SUPPORTED` and continues using the recovered 10,000 ms value.
 

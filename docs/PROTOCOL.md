@@ -347,9 +347,9 @@ immediately.  Every later reliable message waits until the first one has been ac
 The ACK that sets `syn_acknowledged` does not have to name a separately remembered SYN ID.  It is the first ACK that covers newly acknowledged reliable data after SYN was sent.  With a correct peer,
 the only reliable message that can be outstanding at this point is the first one.
 
-Creating an outgoing handle does not send SYN by itself.  With keepalive disabled, an application that never sends a reliable message sends no SYN.  With keepalive enabled, the next configured
-`SYSTEM | MSGID` keepalive may become the first reliable message and carry SYN.  Unreliable data sent before SYN cannot create the peer's connection.  It stays in `ready_messages` until a reliable
-message establishes this direction and its ACK arrives.
+Creating an outgoing handle does not send SYN by itself.  The direction remains unestablished until the application queues a reliable message or starts a clean close, whose FIN can be that first
+reliable message.  Keepalive is not eligible until this direction has already sent SYN, so it cannot establish the direction.  Unreliable data sent before SYN cannot create the peer's connection.  It
+stays in `ready_messages` until a reliable message establishes this direction and its ACK arrives.
 
 Each direction has its own first reliable ID.  The first reliable response may therefore carry its own `SYN` even though both sides already have a connection object.
 
@@ -685,8 +685,8 @@ event_time = max(backend_available,
 Absent candidates are omitted from the minimum.
 
 The source scheduler does not omit a ready record when it is an unreliable message waiting for the first reliable SYN.  With no sent message or delayed ACK to make progress, it repeatedly selects an
-expired backend deadline and spins while holding the connection lock.  The default build treats that ready record as having no transmit deadline until a reliable send or keepalive establishes the
-direction.  The queued unreliable message is then sent after the SYN is acknowledged.
+expired backend deadline and spins while holding the connection lock.  The default build treats that ready record as having no transmit deadline until a reliable message establishes the direction.
+The queued unreliable message is then sent after the SYN is acknowledged.
 
 Connection events also include keepalive, traceroute, and linger.  Equal deadlines keep this priority order: transmit, keepalive, traceroute, then linger.
 
@@ -727,7 +727,7 @@ last_reliable_enqueue_time_ms + keepalive_interval_ms
 
 only if:
 
-- the stored reliable receive timestamp is nonzero;
+- this transmit direction has already sent SYN on its first reliable message;
 - local FIN has not been sent;
 - the connection remains active; and
 - peer STOP has not disabled transmission.
@@ -736,11 +736,11 @@ The normal build initializes the interval to 10,000 ms.  `rdplib_connection_enab
 then resorts the event queue.  Changing the interval does not reset `last_reliable_enqueue_time_ms`.  The source faithful build keeps the recovered `+ 10000u` expression and the interval API returns
 `RDPLIB_ERROR_NOT_SUPPORTED`.
 
-The reliable receive timestamp is initialized from the clock when the connection is created and updated on each reliable arrival.  Except when the clock is exactly 0, this test already passes on a
-new connection.  It does not prove that a reliable packet has arrived.  The useful gates are the keepalive option and the FIN, connected, and STOP state.
+The SYN-sent gate tracks this direction only.  Receiving reliable traffic from the peer does not make local keepalive eligible, and SYN does not need to be acknowledged before keepalive scheduling
+can begin.
 
-Keepalive is a 0 byte `SYSTEM | MSGID` reliable message.  It consumes an ID, may carry SYN, uses the normal queues and pacing, is retransmitted, and must be ACKed.  Receiving it updates reliable
-and ACK state but does not create an application message.
+Keepalive is a 0 byte `SYSTEM | MSGID` reliable message.  It consumes an ID, uses the normal queues and pacing, is retransmitted, and must be ACKed.  It does not establish a transmit direction or carry
+its first SYN.  Receiving it updates reliable and ACK state but does not create an application message.
 
 Timeout checks need an outstanding reliable message.  A completely idle connection has no sent message whose age can be tested.  Keepalive supplies one when there is no application traffic.
 

@@ -88,10 +88,10 @@ RDPLIB_API int rdplib_connect(rdplib_endpoint_t *endpoint, rdplib_connection_t *
 RDPLIB_API void rdplib_connection_release(rdplib_connection_t *connection);
 RDPLIB_API int rdplib_connection_is_usable(rdplib_connection_t *connection);
 
-// Enable reliable keepalives using the current interval, which starts at RDPLIB_DEFAULT_KEEPALIVE_INTERVAL_MS.  Calls may be repeated.
+// Enable reliable keepalives after this direction has sent its first reliable SYN.  The current interval starts at RDPLIB_DEFAULT_KEEPALIVE_INTERVAL_MS.  Calls may be repeated.
 RDPLIB_API int rdplib_connection_enable_keepalive(rdplib_connection_t *connection);
 
-// Set and enable a per connection interval in the normal build.  The source faithful build returns RDPLIB_ERROR_NOT_SUPPORTED.
+// Set and enable a per connection interval in the normal build.  Keepalive does not establish an idle direction.  The source faithful build returns RDPLIB_ERROR_NOT_SUPPORTED.
 RDPLIB_API int rdplib_connection_enable_keepalive_with_interval(rdplib_connection_t *connection, uint32_t interval_ms);
 
 // Install or replace the normal build's packet drop callback.  A null

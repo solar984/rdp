@@ -238,7 +238,7 @@ void connection_recalc_event_timeout(connection_t *connection, rdp_timeout_data_
         timeout->deadline_ms = transmit->delayed_ack_deadline_ms;
     }
 
-    if ((connection->options & RDP_CONNECTION_FEATURE_KEEPALIVE) && receive->recording.last_reliable_receive_time_ms && !transmit->fin_sent && transmit->connected && !transmit->transmit_stopped
+    if ((connection->options & RDP_CONNECTION_FEATURE_KEEPALIVE) && transmit->syn_sent && !transmit->fin_sent && transmit->connected && !transmit->transmit_stopped
 #ifndef RDPLIB_SOURCE_FAITHFUL
         && (uint16_t)(transmit->reliable_next_message_id - transmit->acknowledged_through_message_id - 1u) < RDP_BITARRAY_BITS - 1u
 #endif

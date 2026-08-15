@@ -141,7 +141,7 @@ first application reliable        SYN | MSGID
 reliable ordered application      MSGID | SEQUENCED
 reliable fragment zero            MSGID | FRAGMENT [| SEQUENCED]
 later reliable fragment           MSGID | FRAGMENT
-keepalive                          SYSTEM | MSGID
+keepalive                         SYSTEM | MSGID
 locally closing FIN on the wire   STOP | FIN | MSGID [| SYN]
 pure acknowledgement              ACKTHRU or MASKOFFSET [| mask length]
 ```
@@ -295,6 +295,8 @@ Relative to the latest accepted packet sequence:
 | greater than `+4096` | too far in the future, discard                                         |
 
 An accepted forward gap shifts the 64 bit history. A gap greater than 64 clears it. An accepted reordered packet sets its historical bit without moving the latest sequence.
+
+The validation checks are the same in both profiles. Recording differs: the source faithful build keeps the recovered signed 32 bit mask calculation for reordered packets, while the default build uses the full 64 bit history. At bit 31 and beyond, the source faithful calculation can set the wrong history bits.
 
 After the packet sequence moves more than 16,000 positions beyond a separate stream reset value, all 20 sequenced unreliable floors are reset to `packet_sequence - 1`.  This brings them back near
 the current packet sequence.  It does not clear reliable history.
@@ -534,7 +536,7 @@ even when every later message has already arrived.
 
 ### Send buffer byte limit
 
-The sender adds the serialized bytes in `sent_messages`, `ready_messages`, and `window_blocked_messages`.  The source faithful check only rejects when the current total is already above the limit; it
+The sender adds the serialized bytes in `sent_messages`, `ready_messages`, and `window_blocked_messages`.  In both profiles, the check rejects only when the current total is already above the limit; it
 does not include the new send.  One call can therefore cross the configured limit.  Send result 14 means the caller should keep its data and try again later.
 
 The 4,096 ID limit is separate from bytes.  Many small reliable messages can run out of IDs while using little buffer space.  Send result 15 reports this case.  The default build rejects a fragmented
@@ -583,7 +585,7 @@ After that:
 
 1. an out of window reliable record enters `window_blocked_messages`;
 2. an in window record enters `ready_messages` when SYN is unacknowledged, pacing is unavailable, serial is unavailable, or an older ready record already owns FIFO priority;
-3. a first transmission stamps `first_sent_time_ms` and `last_sent_time_ms`, changes transmission count from 0 to 1, and places a reliable record in `sent_messages`; and
+3. a first transmission stamps `time_first_sent` and `time_last_sent`, changes `attempts` from 0 to 1, and places a reliable record in `sent_messages`; and
 4. an unreliable record is freed immediately after its first send attempt.
 
 When ACKTHRU opens the window, newly eligible blocked messages go through the normal send checks again.  They may send immediately or join `ready_messages`; ACK processing does not bypass pacing or
@@ -604,6 +606,8 @@ The sender maintains a virtual byte backlog:
 queued_bytes -= min(queued_bytes,
                     bytes_per_second * elapsed_ms / 1000)
 ```
+
+The source faithful build keeps the recovered 32 bit multiplication when reducing the backlog, so the product can wrap before division.  The default build uses the 64 bit result shown above.
 
 On a successful UDP send it charges:
 
@@ -699,15 +703,17 @@ The estimator holds 64 weighted samples. It starts with a 500 ms seed. A generic
 
 ```text
 sample_ms = min(measured_ms, 65535)
-weight    = max(1023 / transmission_count, 1)
+weight    = max(1023 / attempts, 1)
 ```
 
 The ACK path only samples a message sent once, so live samples have weight 1023 and retransmissions add no sample.  The integer mean and deviation feed the two thresholds above.  RTO is limited to 50
 through 65,535 ms.
 
+The source faithful build keeps the recovered 32 bit products in the weighted square calculation.  The default build uses 64 bit products so larger samples do not wrap before they enter the accumulator.
+
 ### Retransmission timing
 
-`first_sent_time_ms` never changes. Every retry changes `last_sent_time_ms`, increments the 16 bit transmission count, obtains the current packet sequence, piggybacks any current ACK report, and
+`time_first_sent` never changes. Every retry changes `time_last_sent`, increments the 16 bit `attempts` count, obtains the current packet sequence, piggybacks any current ACK report, and
 rotates the record to the sent tail.
 
 This means:
@@ -846,9 +852,9 @@ Reliability and application ordering are independent:
 | no `MSGID`, no `SEQUENCED` | packet sequence filter only     | deliver immediately when nonempty                                                                                          |
 | `MSGID`, no `SEQUENCED`    | reliable ID prevents redelivery | deliver immediately, even if earlier reliable IDs are missing                                                              |
 | `SEQUENCED`, no `MSGID`    | packet sequence filter          | compare with the stream floor; accept at/ahead and set the floor to sequence+1; discard older packets; never wait for gaps |
-| `SEQUENCED | MSGID`        | reliable ID prevents redelivery | sort by 8 bit stream sequence and deliver only the contiguous prefix                                                       |
-| `SYSTEM | MSGID`           | reliable message bookkeeping    | do not deliver to the application                                                                                          |
-| `FIN | MSGID`              | reliable message bookkeeping    | hold until the cumulative reliable base reaches the FIN ID, then deliver the final arrival                                 |
+| `SEQUENCED \| MSGID`        | reliable ID prevents redelivery | sort by 8 bit stream sequence and deliver only the contiguous prefix                                                       |
+| `SYSTEM \| MSGID`           | reliable message bookkeeping    | do not deliver to the application                                                                                          |
+| `FIN \| MSGID`              | reliable message bookkeeping    | hold until the cumulative reliable base reaches the FIN ID, then deliver the final arrival                                 |
 
 An ACK means that the transport received the reliable ID.  It does not mean the application has seen the message.  An ordered message may be ACKed while it waits for an earlier stream sequence, and a
 fragment may be ACKed while the complete message is still missing pieces.
@@ -947,7 +953,7 @@ The default build adds checks and state corrections around these boundaries with
 
 `RDPLIB_SOURCE_FAITHFUL=ON` builds the original versions and keeps their unchecked assumptions.  It uses the same function names.  There is no second set of alternate symbols.
 
-The default build does not change normal ACKs, sequence windows, pacing, retransmission, timeouts, close framing, CRC, or cipher.  The clients see the same bytes during a normal exchange.
+The profiles use the same normal packet framing, CRC, and cipher.  The default corrections described above can change local validation, timing, and failure behavior.
 
 Important source faithful edge behavior includes:
 
@@ -1050,23 +1056,3 @@ loss declaration.
 | Source send buffer default           |                          8,000 serialized bytes |
 | Bandwidth immediate threshold        |                             configured rate / 8 |
 | Virtual IPv4/UDP charge              |                28 bytes per successful datagram |
-
-## Implementation reading map
-
-The source is the final authority:
-
-| Subject                                              | Implementation                             |
-| ---------------------------------------------------- | ------------------------------------------ |
-| Flags and shared constants                           | `include/rdplib_constants.h`               |
-| Optional message field serialization                 | `src/msg_outgoing.c`                       |
-| CRC, encryption padding, UDP send                    | `src/crc.c`, `src/cypher.c`, `src/usend.c` |
-| Receive and application routing                      | `src/rdp.c`                                |
-| Parsing, close state, event selection                | `src/connection.c`                         |
-| Packet/message receive windows and ACK construction  | `src/rx.c`                                 |
-| Send checks, ACK application, retransmission, pacing | `src/tx.c`                                 |
-| Byte rate model                                      | `src/bandwidth.c`                          |
-| RTT estimator                                        | `src/timeout.c`                            |
-| Fragment storage and metadata                        | `src/msg_arrival.c`                        |
-| Serial envelope and receive parser                   | `src/serial.c`, `src/serial_rx.c`          |
-
-Use [API.md](API.md) for the normal application interface.

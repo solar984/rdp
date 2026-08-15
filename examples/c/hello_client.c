@@ -7,12 +7,12 @@
 
 #include "rdp.h"
 
-static rdp_global_statistics_t example_statistics;
+static rdp_stat example_statistics;
 
 int main(int argc, char **argv)
 {
     static const char greeting[] = "hello from the raw RDP interface";
-    const char *host = argc > 1 ? argv[1] : "127.0.0.1";
+    char *host = argc > 1 ? argv[1] : "127.0.0.1";
     uint16_t port = argc > 2 ? (uint16_t)strtoul(argv[2], NULL, 10) : 9000;
     rdp_t *owner = NULL;
     connection_t *connection = NULL;

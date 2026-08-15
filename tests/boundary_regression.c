@@ -15,6 +15,7 @@
 #include "connhash.h"
 #include "rdplib_platform.h"
 #include "stats.h"
+#include "rdpstat.h"
 #include "usend.h"
 
 #ifdef _WIN32
@@ -44,7 +45,7 @@ enum
     TEST_PROTOCOL_UDP = 17
 };
 
-static rdp_global_statistics_t test_statistics;
+static rdp_stat test_statistics;
 
 static const char *selected_mode(void)
 {
@@ -58,6 +59,11 @@ static const char *selected_mode(void)
 static void store_native_u16(uint8_t *destination, uint16_t value)
 {
     memcpy(destination, &value, sizeof(value));
+}
+
+static struct sockaddr *as_sockaddr(uint8_t address[16])
+{
+    return (struct sockaddr *)(void *)address;
 }
 
 static void store_network_u16(uint8_t *destination, uint16_t value)
@@ -89,11 +95,11 @@ static int write_bytes(const char *path, const void *data, size_t bytes)
     return 1;
 }
 
-static int write_valid_result(const char *path, uint32_t wire_bytes, rdp_rx_arrival_disposition_t disposition, const _rdp_header_t *header)
+static int write_valid_result(const char *path, uint32_t wire_bytes, rdp_rx_arrival_disposition_t disposition, const rdp_header_t *header)
 {
     char text[256];
-    int text_bytes = snprintf(text, sizeof(text), "wire_bytes=%u\ndisposition=%d\nflags=0x%04X\nsequence=%u\nheader_bytes=%u\npayload_bytes=%u\n", wire_bytes, disposition, header->flags,
-                              header->sequence, header->header_bytes, header->payload_bytes);
+    int text_bytes = snprintf(text, sizeof(text), "wire_bytes=%u\ndisposition=%d\nflags=0x%04X\nsequence=%u\nheader_bytes=%u\npayload_bytes=%u\n", wire_bytes, disposition, header->options,
+                              header->seqnum, header->header_size, header->data_size);
 
     return text_bytes > 0 && (size_t)text_bytes < sizeof(text) && write_bytes(path, text, (size_t)text_bytes);
 }
@@ -102,7 +108,7 @@ static int run_valid_wire(const char *wire_path, const char *result_path)
 {
     static const uint8_t header_bytes[] = {0x00, 0x00, 0x00, 0x01};
     static const uint8_t payload_bytes[] = {0x52, 0x44, 0x50, 0x2D, 0x43, 0x48, 0x45, 0x43, 0x4B, 0x45, 0x44};
-    rdp_buffer_t buffers[2];
+    iov_t iov[2];
     uint8_t receiver_address[16] = {0};
     uint8_t source_address[16] = {0};
     uint8_t received[64];
@@ -111,14 +117,14 @@ static int run_valid_wire(const char *wire_path, const char *result_path)
     intptr_t sender = -1;
     int32_t received_bytes;
     connection_t connection;
-    _rdp_header_t parsed;
+    rdp_header_t parsed;
     rdp_rx_arrival_disposition_t disposition;
     int result = 1;
 
-    buffers[0].data = header_bytes;
-    buffers[0].bytes = sizeof(header_bytes);
-    buffers[1].data = payload_bytes;
-    buffers[1].bytes = sizeof(payload_bytes);
+    iov[0].data = (void *)header_bytes;
+    iov[0].size = sizeof(header_bytes);
+    iov[1].data = (void *)payload_bytes;
+    iov[1].size = sizeof(payload_bytes);
 
     if (rdplib_platform_network_startup(TEST_NETWORK_VERSION) != 0)
     {
@@ -139,7 +145,7 @@ static int run_valid_wire(const char *wire_path, const char *result_path)
         goto done;
     }
 
-    result = usend(sender, buffers, 2, receiver_address, 0, 1);
+    result = (int)usend(sender, iov, 2, as_sockaddr(receiver_address), 0, 1);
     if (result != 0)
     {
         fprintf(stderr, "selected usend returned %d for valid input\n", result);
@@ -158,11 +164,11 @@ static int run_valid_wire(const char *wire_path, const char *result_path)
     memset(&parsed, 0, sizeof(parsed));
     memset(&test_statistics, 0, sizeof(test_statistics));
     g_rdp_stat = &test_statistics;
-    disposition = connection_parse_and_validate_arrival(&connection, received, (uint16_t)(received_bytes - (int32_t)sizeof(uint32_t)), &parsed);
-    if (disposition != RDP_RX_ACCEPT || parsed.flags != 0 || parsed.sequence != 1 || parsed.header_bytes != sizeof(header_bytes) || parsed.payload_bytes != sizeof(payload_bytes))
+    disposition = connection_parse_and_validate_arrival(&connection, (uint16_t *)(void *)received, (uint16_t)(received_bytes - (int32_t)sizeof(uint32_t)), &parsed);
+    if (disposition != RDP_RX_ACCEPT || parsed.options != 0 || parsed.seqnum != 1 || parsed.header_size != sizeof(header_bytes) || parsed.data_size != sizeof(payload_bytes))
     {
-        fprintf(stderr, "selected parser changed valid input: disposition %d flags 0x%04X sequence %u header %u payload %u\n", disposition, parsed.flags, parsed.sequence, parsed.header_bytes,
-                parsed.payload_bytes);
+        fprintf(stderr, "selected parser changed valid input: disposition %d flags 0x%04X sequence %u header %u payload %u\n", disposition, parsed.options, parsed.seqnum, parsed.header_size,
+                parsed.data_size);
         result = 1;
         goto done;
     }
@@ -192,7 +198,7 @@ done:
 
 static int run_usend_overflow(void)
 {
-    rdp_buffer_t buffer;
+    iov_t iov;
     uint8_t destination[16] = {0};
     uint8_t *payload = (uint8_t *)malloc(65507);
     int result;
@@ -205,9 +211,9 @@ static int run_usend_overflow(void)
     store_native_u16(destination, TEST_AF_INET);
     destination[4] = 127;
     destination[7] = 1;
-    buffer.data = payload;
-    buffer.bytes = 65507;
-    result = usend(-1, &buffer, 1, destination, 0, 1);
+    iov.data = payload;
+    iov.size = 65507;
+    result = (int)usend(-1, &iov, 1, as_sockaddr(destination), 0, 1);
     printf("build=%s function=usend result=%d\n", selected_mode(), result);
     free(payload);
 #ifndef RDPLIB_SOURCE_FAITHFUL
@@ -273,7 +279,7 @@ static void free_guarded_packet(void *allocation, size_t allocation_bytes)
 static int run_parser_short(void)
 {
     connection_t connection;
-    _rdp_header_t parsed;
+    rdp_header_t parsed;
     void *allocation = NULL;
     size_t allocation_bytes = 0;
     uint8_t *packet = allocate_guarded_packet(&allocation, &allocation_bytes);
@@ -289,12 +295,12 @@ static int run_parser_short(void)
     memset(&parsed, 0xA5, sizeof(parsed));
     memset(&test_statistics, 0, sizeof(test_statistics));
     g_rdp_stat = &test_statistics;
-    result = connection_parse_and_validate_arrival(&connection, packet, 2, &parsed);
-    printf("build=%s function=connection_parse_and_validate_arrival result=%d header_unchanged=%d\n", selected_mode(), result, parsed.flags == UINT16_C(0xA5A5));
+    result = connection_parse_and_validate_arrival(&connection, (uint16_t *)(void *)packet, 2, &parsed);
+    printf("build=%s function=connection_parse_and_validate_arrival result=%d header_unchanged=%d\n", selected_mode(), result, parsed.options == UINT16_C(0xA5A5));
     free_guarded_packet(allocation, allocation_bytes);
     g_rdp_stat = NULL;
 #ifndef RDPLIB_SOURCE_FAITHFUL
-    return result == RDP_RX_ABORT && parsed.flags == UINT16_C(0xA5A5) ? 0 : 3;
+    return result == RDP_RX_ABORT && parsed.options == UINT16_C(0xA5A5) ? 0 : 3;
 #else
     return 0;
 #endif
@@ -309,7 +315,7 @@ static int run_fragment_final(uint32_t payload_bytes)
     };
     uint8_t packet[TEST_FRAGMENT_HEADER_BYTES + TEST_FRAGMENT_MAX_PAYLOAD_BYTES];
     connection_t connection;
-    _rdp_header_t parsed;
+    rdp_header_t parsed;
     rdp_rx_arrival_disposition_t disposition;
     uint64_t global_invalid_before;
     uint32_t connection_invalid_before;
@@ -328,27 +334,27 @@ static int run_fragment_final(uint32_t payload_bytes)
     memset(&connection, 0, sizeof(connection));
     memset(&parsed, 0, sizeof(parsed));
     memset(&test_statistics, 0, sizeof(test_statistics));
-    connection.transmit.connected = 1;
+    connection.tx_connected = 1;
     g_rdp_stat = &test_statistics;
-    global_invalid_before = test_statistics.invalid_fragment_headers;
-    connection_invalid_before = connection.receive.recording.statistics.invalid_fragment_count;
-    connected_before = connection.transmit.connected;
-    disposition = connection_parse_and_validate_arrival(&connection, packet, (uint16_t)(TEST_FRAGMENT_HEADER_BYTES + payload_bytes), &parsed);
-    assembly_unchanged = connection.receive.ownership.fragment_messages.head == NULL && connection.receive.ownership.fragment_messages.count == 0;
+    global_invalid_before = test_statistics.discarded_bad_fragment;
+    connection_invalid_before = connection.stat.discarded_bad_fragment;
+    connected_before = connection.tx_connected;
+    disposition = connection_parse_and_validate_arrival(&connection, (uint16_t *)(void *)packet, (uint16_t)(TEST_FRAGMENT_HEADER_BYTES + payload_bytes), &parsed);
+    assembly_unchanged = connection.rx_reassembly_pool.list.head == NULL && connection.rx_reassembly_pool.list.size == 0;
 
     printf("build=%s function=connection_parse_and_validate_arrival payload_bytes=%u disposition=%d global_invalid_delta=%llu connection_invalid_delta=%u connected_changed=%d assembly_unchanged=%d\n",
-           selected_mode(), payload_bytes, disposition, (unsigned long long)(test_statistics.invalid_fragment_headers - global_invalid_before),
-           connection.receive.recording.statistics.invalid_fragment_count - connection_invalid_before, connection.transmit.connected != connected_before, assembly_unchanged);
+           selected_mode(), payload_bytes, disposition, (unsigned long long)(test_statistics.discarded_bad_fragment - global_invalid_before),
+           connection.stat.discarded_bad_fragment - connection_invalid_before, connection.tx_connected != connected_before, assembly_unchanged);
     g_rdp_stat = NULL;
 #ifndef RDPLIB_SOURCE_FAITHFUL
-    return disposition == RDP_RX_ABORT && test_statistics.invalid_fragment_headers == global_invalid_before + 1u &&
-                   connection.receive.recording.statistics.invalid_fragment_count == connection_invalid_before + 1u && !connection.transmit.connected &&
-                   connection.transmit.disconnect_reason == RDP_DISCONNECT_REASON_PROTOCOL_ERROR && assembly_unchanged
+    return disposition == RDP_RX_ABORT && test_statistics.discarded_bad_fragment == global_invalid_before + 1u &&
+                   connection.stat.discarded_bad_fragment == connection_invalid_before + 1u && !connection.tx_connected &&
+                   connection.tx_disconnect_reason == RDP_DISCONNECT_REASON_PROTOCOL_ERROR && assembly_unchanged
                ? 0
                : 3;
 #else
-    return disposition == RDP_RX_ACCEPT && test_statistics.invalid_fragment_headers == global_invalid_before &&
-                   connection.receive.recording.statistics.invalid_fragment_count == connection_invalid_before && connection.transmit.connected && assembly_unchanged
+    return disposition == RDP_RX_ACCEPT && test_statistics.discarded_bad_fragment == global_invalid_before &&
+                   connection.stat.discarded_bad_fragment == connection_invalid_before && connection.tx_connected && assembly_unchanged
                ? 0
                : 3;
 #endif
@@ -369,21 +375,21 @@ static int run_send_stream(void)
     g_rdp_stat = &test_statistics;
     fast_malloc_init(1024u * 1024u);
     if (rdp_create(&server, 0, 1, RDP_CREATE_REQUIRE_IPV4) != 0 || rdp_create(&client, 0, 1, RDP_CREATE_REQUIRE_IPV4) != 0 ||
-        rdp_connect(client, &public_connection, "127.0.0.1", (uint16_t)(((uint16_t)server->ipv4_address[2] << 8) | server->ipv4_address[3]), 0) != 0)
+        rdp_connect(client, &public_connection, "127.0.0.1", ntohs(server->local_udp_addr.sin_port), 0) != 0)
     {
         fprintf(stderr, "send-stream fixture creation failed\n");
         goto done;
     }
 
     connection = (connection_t *)public_connection;
-    next_message_id = connection->transmit.reliable_next_message_id;
+    next_message_id = connection->tx_next_msgid;
     result = connection_send(public_connection, payload, sizeof(payload), 20, RDP_SEND_RELIABLE);
-    printf("build=%s function=connection_send result=%d next_id_changed=%d syn_published=%u\n", selected_mode(), result, connection->transmit.reliable_next_message_id != next_message_id,
-           connection->transmit.syn_sent);
+    printf("build=%s function=connection_send result=%d next_id_changed=%d syn_published=%u\n", selected_mode(), result, connection->tx_next_msgid != next_message_id,
+           connection->tx_syn_sent);
 #ifndef RDPLIB_SOURCE_FAITHFUL
-    process_result = result == TEST_INVALID_ARGUMENT && connection->transmit.reliable_next_message_id == next_message_id && !connection->transmit.syn_sent ? 0 : 3;
+    process_result = result == TEST_INVALID_ARGUMENT && connection->tx_next_msgid == next_message_id && !connection->tx_syn_sent ? 0 : 3;
 #else
-    process_result = result == 0 && connection->transmit.reliable_next_message_id != next_message_id && connection->transmit.syn_sent ? 0 : 3;
+    process_result = result == 0 && connection->tx_next_msgid != next_message_id && connection->tx_syn_sent ? 0 : 3;
 #endif
 
 done:
@@ -415,7 +421,7 @@ static int run_send_history(void)
     g_rdp_stat = &test_statistics;
     fast_malloc_init(4u * 1024u * 1024u);
     if (rdp_create(&server, 0, 1, RDP_CREATE_REQUIRE_IPV4) != 0 || rdp_create(&client, 0, 1, RDP_CREATE_REQUIRE_IPV4) != 0 ||
-        rdp_connect(client, &public_connection, "127.0.0.1", (uint16_t)(((uint16_t)server->ipv4_address[2] << 8) | server->ipv4_address[3]), 0) != 0)
+        rdp_connect(client, &public_connection, "127.0.0.1", ntohs(server->local_udp_addr.sin_port), 0) != 0)
     {
         fprintf(stderr, "send-history fixture creation failed\n");
         goto done;
@@ -423,14 +429,14 @@ static int run_send_history(void)
 
     connection = (connection_t *)public_connection;
     connection_set_send_buffer_size(public_connection, 4u * 1024u * 1024u);
-    next_message_id = connection->transmit.reliable_next_message_id;
-    connection->transmit.acknowledged_through_message_id = (uint16_t)(next_message_id - 4089u);
+    next_message_id = connection->tx_next_msgid;
+    connection->tx_acked_thru = (uint16_t)(next_message_id - 4089u);
     result = connection_send(public_connection, payload, sizeof(payload), 0, RDP_SEND_RELIABLE);
-    printf("build=%s function=connection_send result=%d next_id_delta=%u\n", selected_mode(), result, (uint16_t)(connection->transmit.reliable_next_message_id - next_message_id));
+    printf("build=%s function=connection_send result=%d next_id_delta=%u\n", selected_mode(), result, (uint16_t)(connection->tx_next_msgid - next_message_id));
 #ifndef RDPLIB_SOURCE_FAITHFUL
-    process_result = result == TEST_HISTORY_FULL && connection->transmit.reliable_next_message_id == next_message_id ? 0 : 3;
+    process_result = result == TEST_HISTORY_FULL && connection->tx_next_msgid == next_message_id ? 0 : 3;
 #else
-    process_result = result == 0 && (uint16_t)(connection->transmit.reliable_next_message_id - next_message_id) == 8 ? 0 : 3;
+    process_result = result == 0 && (uint16_t)(connection->tx_next_msgid - next_message_id) == 8 ? 0 : 3;
 #endif
 
 done:
@@ -449,19 +455,20 @@ done:
 
 static int run_connhash_invalid(void)
 {
-    rdp_connhash_t hash;
-    rdp_connhash_bucket_t *initial_buckets = (rdp_connhash_bucket_t *)(uintptr_t)1;
-    int result;
+    connhash_t hash;
+    hashbin_t *initial_table = (hashbin_t *)(uintptr_t)1;
+    uint32_t result;
 
-    hash.bucket_count = UINT16_C(0xA5A5);
-    hash.buckets = initial_buckets;
-    result = connhash_create(&hash, 17);
-    printf("build=%s function=connhash_create result=%d bucket_count_changed=%d buckets_changed=%d\n", selected_mode(), result, hash.bucket_count != UINT16_C(0xA5A5), hash.buckets != initial_buckets);
+    hash.table_size = UINT16_C(0xA5A5);
+    hash.table = initial_table;
+    result = connhash_create(&hash, 13);
+    printf("build=%s function=connhash_create result=%u table_size_changed=%d table_changed=%d\n", selected_mode(), result, hash.table_size != UINT16_C(0xA5A5),
+           hash.table != initial_table);
 
 #ifndef RDPLIB_SOURCE_FAITHFUL
-    return result == 1 && hash.bucket_count == UINT16_C(0xA5A5) && hash.buckets == initial_buckets ? 0 : 3;
+    return result == 1 && hash.table_size == UINT16_C(0xA5A5) && hash.table == initial_table ? 0 : 3;
 #else
-    if (hash.buckets != initial_buckets && hash.buckets)
+    if (hash.table != initial_table && hash.table)
     {
         connhash_destroy(&hash);
     }

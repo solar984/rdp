@@ -19,9 +19,13 @@ set(RDPLIB_SOURCES
     src/cmp.c
     src/crc.c
     src/cypher.c
+    src/dpc.c
+    src/dpf.c
     src/eventq.c
     src/fast_malloc.c
+    src/hash.c
     src/list.c
+    src/log.c
     src/msg_arrival.c
     src/msg_outgoing.c
     src/rdplib.c
@@ -34,7 +38,7 @@ set(RDPLIB_SOURCES
     src/serial_rx.c
     src/rdpstat.c
     src/timeout.c
-    src/trace_format.c
+    src/trace.c
     src/tx.c
     src/usend.c
     src/ustrerror.c
@@ -79,12 +83,16 @@ function(rdplib_configure_library target_name)
     if(RDPLIB_SOURCE_FAITHFUL)
         target_compile_definitions(${target_name} PRIVATE RDPLIB_SOURCE_FAITHFUL)
     endif()
-
     if(MSVC)
         target_compile_options(${target_name} PRIVATE /W4)
-        target_link_libraries(${target_name} PUBLIC ws2_32)
+        target_link_libraries(${target_name} PUBLIC ws2_32 winmm)
     else()
         target_compile_options(${target_name} PRIVATE -Wall -Wextra)
+        if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+            # Recovered headers intentionally emit ordinary static helpers into
+            # translation units that do not necessarily call every helper.
+            target_compile_options(${target_name} PRIVATE -Wno-unused-function)
+        endif()
         target_link_libraries(${target_name} PUBLIC Threads::Threads)
         if(UNIX)
             target_compile_definitions(${target_name} PRIVATE _POSIX_C_SOURCE=200809L)
@@ -98,6 +106,11 @@ endfunction()
 
 add_library(rdplib STATIC ${RDPLIB_SOURCES})
 rdplib_configure_library(rdplib)
+if(RDPLIB_SOURCE_FAITHFUL)
+    # The static target also supports the raw interface. Its consumers need
+    # the same profile because declarations and layouts change.
+    target_compile_definitions(rdplib INTERFACE RDPLIB_SOURCE_FAITHFUL)
+endif()
 
 if(RDPLIB_BUILD_SHARED)
     add_library(rdplib_shared SHARED ${RDPLIB_SOURCES})

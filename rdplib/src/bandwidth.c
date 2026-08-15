@@ -3,63 +3,99 @@
 
 #include "bandwidth.h"
 
-// Supplied by the selected platform module.
-extern uint32_t time_get_ms(void);
+#ifdef RDPLIB_DEBUG
+#include <assert.h>
 
-uint32_t bandwidth_init(_bandwidth_t *bandwidth)
+#include "dpf.h"
+#endif
+#include "utime.h"
+
+void bandwidth_init(bandwidth_t *bandwidth)
 {
-    bandwidth->queued_bytes = 0;
-    bandwidth->update_time_ms = time_get_ms();
-    bandwidth->bytes_per_second = 3000;
-    return bandwidth->update_time_ms;
+    bandwidth->queue_size = 0;
+    bandwidth->queue_time = time_get_ms();
+    bandwidth->bandwidth = 3000;
 }
 
-uint32_t bandwidth_get_queue_size(_bandwidth_t *bandwidth)
+void bandwidth_enqueue_bytes(bandwidth_t *bandwidth, uint32_t size)
 {
-    if (bandwidth->queued_bytes)
-    {
-        uint32_t now_ms = time_get_ms();
-        uint32_t elapsed_ms = now_ms - bandwidth->update_time_ms;
-        uint64_t transmitted = ((uint64_t)bandwidth->bytes_per_second * elapsed_ms) / 1000u;
+    bandwidth->queue_size = bandwidth_get_queue_size(bandwidth) + size;
+    bandwidth->queue_time = time_get_ms();
+#ifdef RDPLIB_DEBUG
+    dpf(1u, "enqueue_bytes( %u ) [%u]\n", size, bandwidth->queue_size);
+#endif
+}
 
-        if (transmitted < bandwidth->queued_bytes)
+uint32_t bandwidth_get_queue_size(bandwidth_t *bandwidth)
+{
+    uint64_t burn;
+    uint32_t time;
+
+    if (bandwidth->queue_size)
+    {
+        time = time_get_ms();
+        burn = ((uint64_t)bandwidth->bandwidth * (time - bandwidth->queue_time)) / 1000u;
+
+        if (burn < bandwidth->queue_size)
         {
-            bandwidth->queued_bytes -= (uint32_t)transmitted;
+#if defined(RDPLIB_SOURCE_FAITHFUL) || defined(RDPLIB_DEBUG)
+            // this incorrectly recomputes the subtraction amount with a 32 bit multiply/divide
+            bandwidth->queue_size -= bandwidth->bandwidth * (time - bandwidth->queue_time) / 1000u;
+#else
+            bandwidth->queue_size -= (uint32_t)burn;
+#endif
         }
         else
         {
-            bandwidth->queued_bytes = 0;
+            bandwidth->queue_size = 0;
         }
-        bandwidth->update_time_ms = now_ms;
+        bandwidth->queue_time = time;
     }
-    return bandwidth->queued_bytes;
+    return bandwidth->queue_size;
 }
 
-uint32_t bandwidth_get_time_empty(const _bandwidth_t *bandwidth)
+uint32_t bandwidth_get_time_empty(bandwidth_t *bandwidth)
 {
-    return bandwidth->update_time_ms + (bandwidth->queued_bytes * 1000u) / bandwidth->bytes_per_second;
+#ifdef RDPLIB_DEBUG
+    assert(bandwidth->queue_size < 2000000);
+#endif
+    return bandwidth->queue_time + (1000u * bandwidth->queue_size) / bandwidth->bandwidth;
 }
 
-uint32_t bandwidth_enqueue_bytes(_bandwidth_t *bandwidth, uint32_t byte_count)
+// unused, retained for historical interest
+#ifdef RDP_DEAD_CODE
+void bandwidth_set_queue_size(bandwidth_t *bandwidth, uint32_t size)
 {
-    if (bandwidth->queued_bytes)
+    bandwidth->queue_size = size;
+    bandwidth->queue_time = time_get_ms();
+}
+
+uint32_t bandwidth_stepup(bandwidth_t *bandwidth)
+{
+    bandwidth->bandwidth = 100u * bandwidth->bandwidth / 99u <= 6000u
+                               ? 100u * bandwidth->bandwidth / 99u
+                               : 6000u;
+    return bandwidth->bandwidth;
+}
+
+uint32_t bandwidth_stepdown(bandwidth_t *bandwidth)
+{
+    bandwidth->bandwidth = 49u * bandwidth->bandwidth / 50u >= 1000u
+                               ? 49u * bandwidth->bandwidth / 50u
+                               : 1000u;
+    return bandwidth->bandwidth;
+}
+
+void bandwidth_set_send_speed(bandwidth_t *bandwidth, uint32_t speed)
+{
+    if (speed)
     {
-        uint32_t now_ms = time_get_ms();
-        uint32_t elapsed_ms = now_ms - bandwidth->update_time_ms;
-        uint64_t transmitted = ((uint64_t)bandwidth->bytes_per_second * elapsed_ms) / 1000u;
-
-        if (transmitted < bandwidth->queued_bytes)
-        {
-            bandwidth->queued_bytes -= (uint32_t)transmitted;
-        }
-        else
-        {
-            bandwidth->queued_bytes = 0;
-        }
-        bandwidth->update_time_ms = now_ms;
+        bandwidth->bandwidth = speed;
+        bandwidth->autoadjust = 0;
     }
-
-    bandwidth->queued_bytes += byte_count;
-    bandwidth->update_time_ms = time_get_ms();
-    return bandwidth->update_time_ms;
+    else
+    {
+        bandwidth->autoadjust = 1;
+    }
 }
+#endif

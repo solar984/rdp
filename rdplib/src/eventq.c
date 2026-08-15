@@ -3,63 +3,70 @@
 
 #include "eventq.h"
 
-#include "connection.h"
+#ifdef RDPLIB_DEBUG
+#include "dpf.h"
+#endif
+#include "utime.h"
 
-int ascending_timeout_data_cmp(const void *left, const void *right)
+static int ascending_timeout_data_cmp(const void *t1, const void *t2)
 {
-    const rdp_timeout_data_t *left_timeout = (const rdp_timeout_data_t *)left;
-    const rdp_timeout_data_t *right_timeout = (const rdp_timeout_data_t *)right;
-    int32_t difference = (int32_t)(left_timeout->infinite - right_timeout->infinite);
+    const timeout_data *time2;
+    const timeout_data *time1;
+    int result;
 
-    if (difference == 0 && !left_timeout->infinite)
+    time1 = (const timeout_data *)t1;
+    time2 = (const timeout_data *)t2;
+    result = (int32_t)(time1->infinite - time2->infinite);
+    if (result == 0 && time1->infinite == 0)
     {
-        difference = (int32_t)(left_timeout->deadline_ms - right_timeout->deadline_ms);
-        if (difference > 0)
+        result = (int32_t)(time1->time - time2->time);
+        if (result > 0)
         {
-            return 1;
+            result = 1;
         }
-        if (difference < 0)
+        else if (result < 0)
         {
-            return -1;
+            result = -1;
         }
     }
-
-    return difference;
+    return result;
+}
+uint32_t eventq_create(eventq_t *eq, uint32_t grow_size)
+{
+    (void)grow_size;
+    umutex_create(&eq->lock);
+    return pqueue_create(&eq->q, 1, ascending_timeout_data_cmp);
 }
 
-int eventq_create(rdp_eventq_t *events)
+struct timeval *eventq_get_event_timeout(eventq_t *eq, struct timeval *timeout_ptr)
 {
-    rdplib_platform_mutex_init(&events->lock);
-    return pqueue_create(&events->queue, 1, ascending_timeout_data_cmp);
-}
+    connection_t *c;
+    uint32_t timeout;
 
-void eventq_destroy(rdp_eventq_t *events)
-{
-    pqueue_destroy(&events->queue);
-    rdplib_platform_mutex_destroy(&events->lock);
-}
-
-rdp_timeval_t *eventq_get_event_timeout(rdp_eventq_t *events, rdp_timeval_t *timeout)
-{
-    connection_t *connection = (connection_t *)pqueue_peek_head(&events->queue);
-    int32_t difference;
-
-    if (!connection || connection->event_timeout.infinite)
+    c = eventq_peek_head(eq);
+    if (c && !c->cn_event_time.infinite)
     {
-        return NULL;
-    }
-
-    difference = (int32_t)(connection->event_timeout.deadline_ms - rdplib_platform_current_time_ms());
-    if (difference < 0)
-    {
-        timeout->seconds = 0;
-        timeout->microseconds = 0;
+        timeout = c->cn_event_time.time - time_get_ms();
+        if ((int32_t)timeout < 0)
+        {
+            timeout_ptr->tv_sec = 0;
+            timeout_ptr->tv_usec = 0;
+        }
+        else
+        {
+            timeout_ptr->tv_sec = (long)(timeout / 1000u);
+            timeout_ptr->tv_usec = (long)(1000u * (timeout % 1000u));
+        }
+#ifdef RDPLIB_DEBUG
+        dpf(0x40u, "select timeout: %u secs, %u usecs\n", (uint32_t)timeout_ptr->tv_sec, (uint32_t)timeout_ptr->tv_usec);
+#endif
     }
     else
     {
-        timeout->seconds = (uint32_t)difference / 1000u;
-        timeout->microseconds = ((uint32_t)difference % 1000u) * 1000u;
+        timeout_ptr = NULL;
+#ifdef RDPLIB_DEBUG
+        dpf(0x40u, "select timeout: infinite\n");
+#endif
     }
-
-    return timeout;
+    return timeout_ptr;
 }

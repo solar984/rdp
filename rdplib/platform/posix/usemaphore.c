@@ -1,64 +1,62 @@
 // Copyright (c) 2026 solar@heliacal.net
 // SPDX-License-Identifier: MIT
 
-#include "rdplib_platform.h"
+#include "usemaphore.h"
 
 #include <errno.h>
+#include <string.h>
 #include <time.h>
 
-void rdplib_platform_semaphore_init(rdplib_platform_semaphore_t *semaphore)
+static uint32_t usemaphore_wait_without_timeout(usemaphore_t *sem);
+
+void usemaphore_init(usemaphore_t *sem)
 {
-    semaphore->created = 0;
+    memset(sem, 0, sizeof(*sem));
 }
 
-int rdplib_platform_semaphore_create(rdplib_platform_semaphore_t *semaphore)
+void usemaphore_destroy(usemaphore_t *sem)
 {
-    if (sem_init(&semaphore->value, 0, 0) != 0)
+    if (sem->created)
     {
-        return 3;
-    }
-
-    semaphore->created = 1;
-    return 0;
-}
-
-void rdplib_platform_semaphore_destroy(rdplib_platform_semaphore_t *semaphore)
-{
-    if (semaphore->created)
-    {
-        (void)sem_destroy(&semaphore->value);
+        (void)sem_destroy(&sem->semid);
     }
 }
 
-static int wait_without_timeout(rdplib_platform_semaphore_t *semaphore)
+uint32_t usemaphore_create(usemaphore_t *sem)
 {
+    uint32_t result;
+
+    result = 0;
+    if (sem_init(&sem->semid, 0, 0) != 0)
+    {
+        result = 3;
+    }
+    else
+    {
+        sem->created = 1;
+    }
+    return result;
+}
+
+uint32_t usemaphore_decrement(usemaphore_t *sem, uint32_t timeout)
+{
+    uint32_t allocated;
     int result;
-
-    do
-    {
-        result = sem_wait(&semaphore->value);
-    } while (result != 0 && errno == EINTR);
-
-    return result == 0;
-}
-
-int rdplib_platform_semaphore_wait(rdplib_platform_semaphore_t *semaphore, int32_t timeout_ms)
-{
     struct timespec deadline;
-    int result;
 
-    if (timeout_ms < 0)
+    allocated = 0;
+    if (timeout == UINT32_MAX)
     {
-        return wait_without_timeout(semaphore);
+        return usemaphore_wait_without_timeout(sem);
     }
-    if (timeout_ms == 0)
+    if (timeout == 0)
     {
-        return sem_trywait(&semaphore->value) == 0;
+        return sem_trywait(&sem->semid) == 0;
     }
 
     (void)clock_gettime(CLOCK_REALTIME, &deadline);
-    deadline.tv_sec += timeout_ms / 1000;
-    deadline.tv_nsec += (long)(timeout_ms % 1000) * 1000000L;
+    deadline.tv_sec += (time_t)(timeout / 1000u);
+    deadline.tv_nsec += (long)(timeout % 1000u) * 1000000L;
     if (deadline.tv_nsec >= 1000000000L)
     {
         ++deadline.tv_sec;
@@ -67,13 +65,28 @@ int rdplib_platform_semaphore_wait(rdplib_platform_semaphore_t *semaphore, int32
 
     do
     {
-        result = sem_timedwait(&semaphore->value, &deadline);
+        result = sem_timedwait(&sem->semid, &deadline);
+    } while (result != 0 && errno == EINTR);
+    if (result == 0)
+    {
+        allocated = 1;
+    }
+    return allocated;
+}
+
+void usemaphore_increment(usemaphore_t *sem)
+{
+    (void)sem_post(&sem->semid);
+}
+
+static uint32_t usemaphore_wait_without_timeout(usemaphore_t *sem)
+{
+    int result;
+
+    do
+    {
+        result = sem_wait(&sem->semid);
     } while (result != 0 && errno == EINTR);
 
     return result == 0;
-}
-
-void rdplib_platform_semaphore_signal(rdplib_platform_semaphore_t *semaphore)
-{
-    (void)sem_post(&semaphore->value);
 }

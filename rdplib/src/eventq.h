@@ -1,50 +1,85 @@
 // Copyright (c) 2026 solar@heliacal.net
 // SPDX-License-Identifier: MIT
 
-// Event queue and wait record.
+// Non owning connection event queue.
 #ifndef RDPLIB_EVENTQ_H
 #define RDPLIB_EVENTQ_H
 
 #include <stdint.h>
+#include <string.h>
 
-#include "container.h"
+#ifndef _WIN32
+#include <sys/time.h>
+#endif
+
 #include "event.h"
-#include "rdplib_platform.h"
+#include "connection.h"
+#include "pqueue.h"
+#include "umutex.h"
 
-typedef struct rdp_eventq_t
+typedef struct _eventq_t
 {
-    rdp_pqueue_t queue;
-    rdplib_platform_mutex_t lock;
-} rdp_eventq_t;
-
-typedef struct rdp_timeval_t
-{
-    uint32_t seconds;
-    uint32_t microseconds;
-} rdp_timeval_t;
+    pqueue_t q;
+    umutex_t lock;
+} eventq_t, *Peventq_t;
 
 #ifdef __cplusplus
 extern "C"
 {
 #endif
 
-// Min heap comparator.
-// Put finite deadlines before infinite entries.  Finite deadlines are
-// compared with wrapping signed 32 bit subtraction.
-int ascending_timeout_data_cmp(const void *left, const void *right);
-
-// Creates the event min heap, initially sized for 1 entry, after initializing its platform lock.
-int eventq_create(rdp_eventq_t *events);
-
-// Releases heap storage and its platform lock. Membership must be empty.
-void eventq_destroy(rdp_eventq_t *events);
-
-// Return NULL when the queue is empty or its first deadline is infinite.  The
-// caller must lock the queue because the clients do not lock it here.
-rdp_timeval_t *eventq_get_event_timeout(rdp_eventq_t *events, rdp_timeval_t *timeout);
+uint32_t eventq_create(eventq_t *eq, uint32_t grow_size);
+struct timeval *eventq_get_event_timeout(eventq_t *eq, struct timeval *timeout_ptr);
 
 #ifdef __cplusplus
 }
 #endif
+
+static void eventq_init(eventq_t *eq)
+{
+    memset(eq, 0, sizeof(*eq));
+}
+
+// The queue must be empty. Connections and their event links remain owned by the caller.
+static void eventq_destroy(eventq_t *eq)
+{
+    pqueue_destroy(&eq->q);
+    umutex_destroy(&eq->lock);
+}
+
+static connection_t *eventq_remove_head(eventq_t *eq)
+{
+    return (connection_t *)pqueue_remove_head(&eq->q);
+}
+
+static connection_t *eventq_peek_head(eventq_t *eq)
+{
+    return (connection_t *)pqueue_peek_head(&eq->q);
+}
+
+static uint32_t eventq_insert(eventq_t *eq, connection_t *c)
+{
+    return pqueue_insert(&eq->q, &c->cn_event_queue_link);
+}
+
+static connection_t *eventq_remove_by_ptr(eventq_t *eq, connection_t *c)
+{
+    return (connection_t *)pqueue_remove_by_link(&eq->q, &c->cn_event_queue_link);
+}
+
+static void eventq_resort_by_ptr(eventq_t *eq, connection_t *c)
+{
+    pqueue_resort_by_link(&eq->q, &c->cn_event_queue_link);
+}
+
+static void eventq_lock(eventq_t *eq)
+{
+    umutex_lock(&eq->lock);
+}
+
+static void eventq_unlock(eventq_t *eq)
+{
+    umutex_unlock(&eq->lock);
+}
 
 #endif /* RDPLIB_EVENTQ_H */

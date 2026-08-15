@@ -1,34 +1,48 @@
 // Copyright (c) 2026 solar@heliacal.net
 // SPDX-License-Identifier: MIT
 
-#include "container.h"
+#include "list.h"
 
-#include <stddef.h>
+#ifdef RDPLIB_DEBUG
+#include <assert.h>
+#endif
 
-void list_init(rdp_list_t *list)
+void list_init(list_t *list)
 {
     list->head = NULL;
     list->tail = NULL;
-    list->count = 0;
-    list->compare = NULL;
+    list->size = 0;
     list->sorted = 0;
+    list->keycmp = NULL;
 }
 
-void list_create(rdp_list_t *list, int sorted, rdp_container_compare_t compare)
+void list_create(list_t *list, uint32_t sorted, keycmp_f keycmp)
 {
     list->sorted = sorted;
-    list->compare = compare;
+    list->keycmp = keycmp;
+#ifdef RDPLIB_DEBUG
+    assert((!sorted) || (keycmp!=NULL));
+#endif
 }
 
-void list_destroy(rdp_list_t *list)
+void list_destroy(list_t *list)
 {
+#ifdef RDPLIB_DEBUG
+    assert(list->head == NULL);
+    assert(list->tail == NULL);
+    assert(list->size == 0);
+#endif
     (void)list;
 }
 
-void list_add_head(rdp_list_t *list, rdp_list_link_t *link)
+void list_add_head(list_t *list, rdp_link_t *link)
 {
+#ifdef RDPLIB_DEBUG
+    assert((!list->sorted) || (list->head==NULL) || (list->keycmp(link->key.p,list->head->key.p)<=0));
+#endif
+
     link->next = list->head;
-    link->previous = NULL;
+    link->prev = NULL;
     list->head = link;
 
     if (!list->tail)
@@ -37,16 +51,20 @@ void list_add_head(rdp_list_t *list, rdp_list_link_t *link)
     }
     else
     {
-        link->next->previous = link;
+        link->next->prev = link;
     }
 
-    ++list->count;
+    ++list->size;
 }
 
-void list_add_tail(rdp_list_t *list, rdp_list_link_t *link)
+void list_add_tail(list_t *list, rdp_link_t *link)
 {
+#ifdef RDPLIB_DEBUG
+    assert((!list->sorted) || (list->tail==NULL) || (list->keycmp(link->key.p,list->tail->key.p)>=0));
+#endif
+
     link->next = NULL;
-    link->previous = list->tail;
+    link->prev = list->tail;
     list->tail = link;
 
     if (!list->head)
@@ -55,130 +73,133 @@ void list_add_tail(rdp_list_t *list, rdp_list_link_t *link)
     }
     else
     {
-        link->previous->next = link;
+        link->prev->next = link;
     }
 
-    ++list->count;
+    ++list->size;
 }
 
-void *list_remove_head(rdp_list_t *list)
+void *list_remove_head(list_t *list)
 {
-    rdp_list_link_t *link = list->head;
-    void *value;
+    void *item;
 
-    if (!link)
-    {
-        return NULL;
-    }
-
-    value = link->value;
-    list->head = link->next;
+    item = NULL;
     if (list->head)
     {
-        list->head->previous = NULL;
+        item = list->head->item;
+        list->head = list->head->next;
+        if (list->head)
+        {
+            list->head->prev = NULL;
+        }
+        else
+        {
+            list->tail = NULL;
+        }
+        --list->size;
     }
-    else
-    {
-        list->tail = NULL;
-    }
-
-    --list->count;
-    return value;
+    return item;
 }
 
-static void *list_remove_tail(rdp_list_t *list)
+void *list_remove_tail(list_t *list)
 {
-    rdp_list_link_t *link = list->tail;
-    void *value;
+    void *item;
 
-    if (!link)
-    {
-        return NULL;
-    }
-
-    value = link->value;
-    list->tail = link->previous;
+    item = NULL;
     if (list->tail)
     {
-        list->tail->next = NULL;
+        item = list->tail->item;
+        list->tail = list->tail->prev;
+        if (list->tail)
+        {
+            list->tail->next = NULL;
+        }
+        else
+        {
+            list->head = NULL;
+        }
+        --list->size;
+    }
+    return item;
+}
+
+void list_insert(list_t *list, rdp_link_t *link)
+{
+    rdp_link_t *current;
+
+    if ((list->head == NULL) || (list->keycmp(list->head->key.p, link->key.p) > 0))
+    {
+        list_add_head(list, link);
+    }
+    else if (list->keycmp(list->tail->key.p, link->key.p) <= 0)
+    {
+        list_add_tail(list, link);
     }
     else
     {
-        list->head = NULL;
-    }
+        current = list->head->next;
+#ifdef RDPLIB_DEBUG
+        assert(current != NULL);
+#endif
+        while (list->keycmp(current->key.p, link->key.p) <= 0)
+        {
+            current = current->next;
+        }
 
-    --list->count;
-    return value;
+        link->next = current;
+        link->prev = current->prev;
+        current->prev = link;
+        link->prev->next = link;
+#ifdef RDPLIB_DEBUG
+        assert(current != NULL);
+#endif
+        ++list->size;
+    }
 }
 
-void list_insert(rdp_list_t *list, rdp_list_link_t *link)
+rdp_link_t *list_find_link_by_key(list_t *list, const void *key)
 {
-    rdp_list_link_t *current;
+    int diff;
+    rdp_link_t *current;
 
-    // The original routine assumes compare is valid and does not inspect sorted.
-    if (!list->head || list->compare(list->head->key, link->key) > 0)
+    for (current = list->head; current; current = current->next)
     {
-        list_add_head(list, link);
-        return;
-    }
-
-    if (list->compare(list->tail->key, link->key) <= 0)
-    {
-        list_add_tail(list, link);
-        return;
-    }
-
-    current = list->head->next;
-    while (list->compare(current->key, link->key) <= 0)
-    {
-        current = current->next;
-    }
-
-    link->next = current;
-    link->previous = current->previous;
-    current->previous = link;
-    link->previous->next = link;
-    ++list->count;
-}
-
-rdp_list_link_t *list_find_link_by_key(rdp_list_t *list, const void *key)
-{
-    rdp_list_link_t *link = list->head;
-
-    while (link)
-    {
-        int comparison = list->compare(link->key, key);
-        if (comparison == 0)
+        diff = list->keycmp(current->key.p, key);
+        if (diff == 0)
         {
             break;
         }
-        if (list->sorted && comparison > 0)
+        if (list->sorted && diff > 0)
         {
-            link = NULL;
-            break;
+            return NULL;
         }
-        link = link->next;
     }
 
-    return link;
+    return current;
 }
 
-void *list_remove_by_link(rdp_list_t *list, rdp_list_link_t *link)
+void *list_remove_by_link(list_t *list, rdp_link_t *link)
 {
-    if (!link->previous)
+    void *item;
+
+    if (link->prev == NULL)
     {
-        // The client removes the current head rather than proving link is that head.
+#ifdef RDPLIB_DEBUG
+        assert(list->head == link);
+#endif
         return list_remove_head(list);
     }
-
-    if (!link->next)
+    if (link->next == NULL)
     {
-        // The corresponding tail path also assumes that the item belongs to this list.
+#ifdef RDPLIB_DEBUG
+        assert(list->tail == link);
+#endif
         return list_remove_tail(list);
     }
 
-    link->previous->next = link->next;
-    link->next->previous = link->previous;
-    --list->count;
-    return link->value;
+    link->prev->next = link->next;
+    link->next->prev = link->prev;
+    item = link->item;
+    --list->size;
+    return item;
 }

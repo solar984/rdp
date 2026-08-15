@@ -3,222 +3,234 @@
 
 #include "connhash.h"
 
+#ifdef RDPLIB_DEBUG
+#include <assert.h>
+#endif
+#include <stddef.h>
 #include <string.h>
 
-#include "connection.h"
+#include "rdplib_connhash.h"
 
 enum
 {
+    SHIFT_SIZE = 12,
     RDP_AF_INET = 2,
-    RDP_AF_FAMILY6 = 6,
-    RDP_AF_LEGACY_45 = 0x45
+    RDP_AF_IPX = 6,
+    RDP_AF_COMPORT = 69
 };
 
-void connhash_init(rdp_connhash_t *hash)
+static uint16_t connhash_hash(connhash_t *ch, struct sockaddr *sa)
 {
-    hash->bucket_count = 0;
-    hash->buckets = 0;
+    uint16_t sum;
+    const uint8_t *sin;
+    const uint8_t *sipx;
+    const uint8_t *address;
+
+#ifdef RDPLIB_DEBUG
+    assert(ch->table_size <= 1<<(SHIFT_SIZE-1));
+#endif
+    address = (const uint8_t *)sa;
+    if (rdplib_connhash_load_u16(address) == RDP_AF_INET)
+    {
+        sin = address;
+        sum = rdplib_connhash_load_u16(sin + 2);
+        sum ^= (uint16_t)rdplib_connhash_load_u32(sin + 4);
+        sum ^= (uint16_t)(rdplib_connhash_load_u32(sin + 4) >> SHIFT_SIZE);
+        sum ^= (uint16_t)(rdplib_connhash_load_u32(sin + 4) >> (2 * SHIFT_SIZE));
+        sum &= (uint16_t)(ch->table_size - 1);
+    }
+    else if (rdplib_connhash_load_u16(address) == RDP_AF_IPX)
+    {
+        sipx = address;
+        sum = rdplib_connhash_load_u16(sipx + 12);
+        sum = (uint16_t)(sum + (int8_t)sipx[2]);
+        sum = (uint16_t)(sum + (int8_t)sipx[3]);
+        sum = (uint16_t)(sum + (int8_t)sipx[4]);
+        sum = (uint16_t)(sum + (int8_t)sipx[5]);
+        sum = (uint16_t)(sum + (int8_t)sipx[6]);
+        sum = (uint16_t)(sum + (int8_t)sipx[7]);
+        sum = (uint16_t)(sum + (int8_t)sipx[8]);
+        sum = (uint16_t)(sum + (int8_t)sipx[9]);
+        sum = (uint16_t)(sum + (int8_t)sipx[10]);
+        sum = (uint16_t)(sum + (int8_t)sipx[11]);
+        sum &= (uint16_t)(ch->table_size - 1);
+    }
+    else
+    {
+        sum = 0;
+    }
+    return sum;
 }
 
-// Recovered name: sockaddr_cmp survives in the PPC and Intel symbols.
-// rdplib deviation: this standalone build uses the native Windows/POSIX 2 byte sockaddr family layout; the Mac source used its native sa_len layout.
-int sockaddr_cmp(const void *left_pointer, const void *right_pointer)
+void connhash_init(connhash_t *ch)
 {
-    const uint8_t *left = (const uint8_t *)left_pointer;
-    const uint8_t *right = (const uint8_t *)right_pointer;
-    uint16_t left_family;
-    uint16_t right_family;
-#ifdef RDPLIB_SOURCE_FAITHFUL
+    ch->table_size = 0;
+    ch->table = NULL;
+}
+
+int sockaddr_cmp(const void *sockaddr_1, const void *sockaddr_2)
+{
+    const uint8_t *sa2;
+    const uint8_t *sa1;
     int result;
-#endif
 
-    memcpy(&left_family, left, sizeof(left_family));
-    memcpy(&right_family, right, sizeof(right_family));
-    if (left_family != right_family)
+    sa1 = (const uint8_t *)sockaddr_1;
+    sa2 = (const uint8_t *)sockaddr_2;
+    if (rdplib_connhash_load_u16(sa1) == rdplib_connhash_load_u16(sa2))
     {
-        return left_family < right_family ? -1 : 1;
-    }
-
-    switch (left_family)
-    {
-    case RDP_AF_INET:
-        return memcmp(left, right, 8);
-    case RDP_AF_FAMILY6:
-        return memcmp(left, right, 14);
-    case RDP_AF_LEGACY_45:
-        return memcmp(left, right, 4);
-    default:
-#ifdef RDPLIB_SOURCE_FAITHFUL
-        // The source returns an uninitialized local for equal unknown families.
-        return result;
-#else
-        return 0;
-#endif
-    }
-}
-
-// Recovered name: connhash_hash survives in the PPC symbols.
-uint16_t connhash_hash(rdp_connhash_t *hash, const uint8_t endpoint[16])
-{
-    uint16_t family;
-    uint16_t port;
-    uint16_t final_word;
-    uint32_t address;
-    uint32_t index;
-
-    memcpy(&family, endpoint, sizeof(family));
-    if (family == RDP_AF_INET)
-    {
-        uint32_t mixed;
-
-        memcpy(&port, endpoint + 2, sizeof(port));
-        memcpy(&address, endpoint + 4, sizeof(address));
-        mixed = port ^ address ^ (address >> 12) ^ (address >> 24);
-        return (uint16_t)(mixed & (uint16_t)(hash->bucket_count - 1));
-    }
-
-    if (family == RDP_AF_FAMILY6)
-    {
-        int32_t mixed;
-
-        memcpy(&final_word, endpoint + 12, sizeof(final_word));
-        mixed = final_word;
-        for (index = 2; index < 12; ++index)
+        switch (rdplib_connhash_load_u16(sa1))
         {
-            mixed += (int8_t)endpoint[index];
+        case RDP_AF_INET:
+            result = memcmp(sa1, sa2, 8);
+            break;
+        case RDP_AF_IPX:
+            result = memcmp(sa1, sa2, 14);
+            break;
+        case RDP_AF_COMPORT:
+            result = memcmp(sa1, sa2, 4);
+            break;
+        default:
+#ifdef RDPLIB_DEBUG
+            assert(!"invalid sockaddr family");
+#endif
+#ifndef RDPLIB_SOURCE_FAITHFUL
+            // Checked builds retain a deterministic ordering if assertions are disabled.
+            result = memcmp(sa1, sa2, 16);
+#endif
+            break;
         }
-        return (uint16_t)((uint16_t)mixed & (uint16_t)(hash->bucket_count - 1));
     }
-
-    return 0;
+    else if (rdplib_connhash_load_u16(sa1) > rdplib_connhash_load_u16(sa2))
+    {
+        result = 1;
+    }
+    else
+    {
+        result = -1;
+    }
+    return result;
 }
 
-int connhash_create(rdp_connhash_t *hash, uint16_t hash_bits)
+uint32_t connhash_create(connhash_t *ch, uint16_t table_size)
 {
-    uint32_t index;
+    uint32_t bin;
+
+#ifdef RDPLIB_SOURCE_FAITHFUL
+    ch->table_size = (uint16_t)(1 << (table_size - 1));
+    ch->table = (hashbin_t *)rdplib_platform_malloc(sizeof(*ch->table) * ch->table_size);
+    // The May 2002 code clears the allocation before checking it for failure.
+    memset(ch->table, 0, sizeof(*ch->table) * ch->table_size);
+    if (ch->table)
+    {
+        for (bin = 0; bin < ch->table_size; ++bin)
+        {
+            list_init(&ch->table[bin].list);
+            list_create(&ch->table[bin].list, 1, sockaddr_cmp);
+            umutex_create(&ch->table[bin].lock);
+        }
+    }
+    return ch->table == NULL;
+#else
+    uint16_t expanded_table_size;
+    hashbin_t *table;
     size_t allocation_bytes;
 
-#ifdef RDPLIB_SOURCE_FAITHFUL
-    hash->bucket_count = (uint16_t)(UINT32_C(1) << (hash_bits - 1u));
-    allocation_bytes = (size_t)hash->bucket_count * sizeof(*hash->buckets);
-    hash->buckets = (rdp_connhash_bucket_t *)rdplib_platform_malloc(allocation_bytes);
-
-    // This intentionally precedes the null check. All 3 clients do the
-    // same, so allocation failure faults instead of returning cleanly.
-    memset(hash->buckets, 0, allocation_bytes);
-
-    if (hash->buckets)
-    {
-        for (index = 0; index < hash->bucket_count; ++index)
-        {
-            list_init(&hash->buckets[index].connections);
-            list_create(&hash->buckets[index].connections, 1, sockaddr_cmp);
-            rdplib_platform_mutex_init(&hash->buckets[index].lock);
-        }
-    }
-
-    return hash->buckets == NULL;
-#else
-    uint16_t bucket_count;
-    rdp_connhash_bucket_t *buckets;
-
-    if (!hash || hash_bits < 1 || hash_bits > 16)
+    if (!ch || table_size < 1 || table_size > SHIFT_SIZE)
     {
         return 1;
     }
 
-    bucket_count = (uint16_t)(UINT32_C(1) << (hash_bits - 1u));
-    allocation_bytes = (size_t)bucket_count * sizeof(*buckets);
-    buckets = (rdp_connhash_bucket_t *)rdplib_platform_malloc(allocation_bytes);
-    if (!buckets)
+    expanded_table_size = (uint16_t)(UINT32_C(1) << (table_size - 1u));
+    allocation_bytes = (size_t)expanded_table_size * sizeof(*table);
+    table = (hashbin_t *)rdplib_platform_malloc(allocation_bytes);
+    if (!table)
     {
         return 1;
     }
 
-    memset(buckets, 0, allocation_bytes);
-    for (index = 0; index < bucket_count; ++index)
+    memset(table, 0, allocation_bytes);
+    for (bin = 0; bin < expanded_table_size; ++bin)
     {
-        list_init(&buckets[index].connections);
-        list_create(&buckets[index].connections, 1, sockaddr_cmp);
-        rdplib_platform_mutex_init(&buckets[index].lock);
+        list_init(&table[bin].list);
+        list_create(&table[bin].list, 1, sockaddr_cmp);
+        umutex_create(&table[bin].lock);
     }
-    hash->bucket_count = bucket_count;
-    hash->buckets = buckets;
+    ch->table_size = expanded_table_size;
+    ch->table = table;
     return 0;
 #endif
 }
 
-void connhash_destroy(rdp_connhash_t *hash)
+void connhash_destroy(connhash_t *ch)
 {
-    uint32_t index;
+    uint32_t bin;
 
-    if (!hash->buckets)
+    if (ch->table)
     {
-        return;
-    }
-
-    for (index = 0; index < hash->bucket_count; ++index)
-    {
-        list_destroy(&hash->buckets[index].connections);
-        rdplib_platform_mutex_destroy(&hash->buckets[index].lock);
-    }
-
-    rdplib_platform_free(hash->buckets);
-    hash->buckets = NULL;
-}
-
-connection_t *connhash_lock(rdp_connhash_t *hash, const uint8_t endpoint[16])
-{
-    rdp_connhash_bucket_t *bucket = &hash->buckets[connhash_hash(hash, endpoint)];
-    rdp_list_link_t *link;
-    connection_t *connection = NULL;
-
-    rdplib_platform_mutex_lock(&bucket->lock);
-    link = list_find_link_by_key(&bucket->connections, endpoint);
-    if (link)
-    {
-        connection = (connection_t *)link->value;
-        if (connection)
+        for (bin = 0; bin < ch->table_size; ++bin)
         {
-            ++connection->reference_count;
+            list_destroy(&ch->table[bin].list);
+            umutex_destroy(&ch->table[bin].lock);
         }
+        rdplib_platform_free(ch->table);
+        ch->table = NULL;
     }
-    rdplib_platform_mutex_unlock(&bucket->lock);
-
-    if (connection)
-    {
-        rdplib_platform_mutex_lock(&connection->lock);
-    }
-
-    return connection;
 }
 
-void connhash_insert(rdp_connhash_t *hash, connection_t *connection)
+connection_t *connhash_lock(connhash_t *ch, struct sockaddr *sa)
 {
-    rdp_connhash_bucket_t *bucket = &hash->buckets[connhash_hash(hash, connection->transmit.remote_address)];
+    uint16_t bin;
+    connection_t *c;
 
-    rdplib_platform_mutex_lock(&bucket->lock);
-    connection->reference_count = 1;
-    list_insert(&bucket->connections, &connection->connection_hash_link);
-    rdplib_platform_mutex_unlock(&bucket->lock);
+    c = NULL;
+    bin = connhash_hash(ch, sa);
+    umutex_lock(&ch->table[bin].lock);
+    c = (connection_t *)list_lookup(&ch->table[bin].list, sa);
+    if (c)
+    {
+        ++c->cn_ref_count;
+    }
+    umutex_unlock(&ch->table[bin].lock);
+    if (c)
+    {
+        umutex_lock(&c->cn_lock);
+    }
+    return c;
 }
 
-connection_t *connhash_subref(rdp_connhash_t *hash, connection_t *connection)
+void connhash_insert(connhash_t *ch, connection_t *c)
 {
-    rdp_connhash_bucket_t *bucket = &hash->buckets[connhash_hash(hash, connection->transmit.remote_address)];
-    connection_t *removed = NULL;
+    uint16_t bin;
 
-    rdplib_platform_mutex_lock(&bucket->lock);
-    --connection->reference_count;
-    if (connection->reference_count == 0)
+#ifdef RDPLIB_DEBUG
+    assert(c != NULL);
+#endif
+    bin = connhash_hash(ch, &c->tx_remote_addr);
+    umutex_lock(&ch->table[bin].lock);
+    c->cn_ref_count = 1;
+    list_insert(&ch->table[bin].list, &c->cn_addr_map_link);
+    umutex_unlock(&ch->table[bin].lock);
+}
+
+connection_t *connhash_subref(connhash_t *ch, connection_t *c)
+{
+    connection_t *removed;
+    uint16_t bin;
+
+    removed = NULL;
+#ifdef RDPLIB_DEBUG
+    assert(c != NULL);
+#endif
+    bin = connhash_hash(ch, &c->tx_remote_addr);
+    umutex_lock(&ch->table[bin].lock);
+    --c->cn_ref_count;
+    if (c->cn_ref_count == 0)
     {
-        rdp_list_link_t *link = list_find_link_by_key(&bucket->connections, connection->transmit.remote_address);
-        if (link)
-        {
-            removed = (connection_t *)list_remove_by_link(&bucket->connections, link);
-        }
+        removed = (connection_t *)list_remove_by_key(&ch->table[bin].list, &c->tx_remote_addr);
+#ifdef RDPLIB_DEBUG
+        assert(removed == c);
+#endif
     }
-    rdplib_platform_mutex_unlock(&bucket->lock);
-
+    umutex_unlock(&ch->table[bin].lock);
     return removed;
 }

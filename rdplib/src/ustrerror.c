@@ -1,168 +1,269 @@
 // Copyright (c) 2026 solar@heliacal.net
 // SPDX-License-Identifier: MIT
 
-#ifdef _MSC_VER
+#if defined(_MSC_VER) && (defined(RDPLIB_DEBUG) || defined(RDPLIB_SOURCE_FAITHFUL) || defined(RDP_DEAD_CODE))
 #define _CRT_SECURE_NO_WARNINGS
 #endif
 
-#include "net_error.h"
+#include "ustrerror.h"
+
+// Recovered diagnostic code. sys_strerror is unused in the May archive and is
+// retained for historical interest; net_strerror served diagnostic callers.
+#if defined(RDPLIB_DEBUG) || defined(RDPLIB_SOURCE_FAITHFUL) || defined(RDP_DEAD_CODE)
 
 #include <stdio.h>
 
-// This was recovered from the clients but we omit the original call sites so this is essentially dead code just here for historical interest.
+static char net_error_string[64];
+#ifdef RDP_DEAD_CODE
+static char sys_error_string[64];
 
-static const char *net_strerror_common(uint32_t error, int include_provider_errors, char *unknown_error)
+char *sys_strerror(uint32_t error_number)
 {
-    switch (error)
+    char *result;
+
+    result = sys_error_string;
+    sprintf(sys_error_string, "%u", error_number);
+    return result;
+}
+#endif
+
+char *net_strerror(uint32_t error_number)
+{
+    char *result;
+
+    result = net_error_string;
+    switch (error_number)
     {
     case 10004:
-        return "WSAEINTR";
+        result = "WSAEINTR";
+        break;
     case 10009:
-        return "WSAEBADF";
+        result = "WSAEBADF";
+        break;
     case 10013:
-        return "WSAEACCES";
+        result = "WSAEACCES";
+        break;
     case 10014:
-        return "WSAEFAULT";
+        result = "WSAEFAULT";
+        break;
     case 10022:
-        return "WSAEINVAL";
+        result = "WSAEINVAL";
+        break;
     case 10024:
-        return "WSAEMFILE";
+        result = "WSAEMFILE";
+        break;
     case 10035:
-        return "WSAEWOULDBLOCK";
+        result = "WSAEWOULDBLOCK";
+        break;
     case 10036:
-        return "WSAEINPROGRESS";
+        result = "WSAEINPROGRESS";
+        break;
     case 10037:
-        return "WSAEALREADY";
+        result = "WSAEALREADY";
+        break;
     case 10039:
-        return "WSAEDESTADDRREQ";
+        result = "WSAEDESTADDRREQ";
+        break;
     case 10040:
-        return "WSAEMSGSIZE";
+        result = "WSAEMSGSIZE";
+        break;
     case 10041:
-        return "WSAEPROTOTYPE";
+        result = "WSAEPROTOTYPE";
+        break;
     case 10042:
-        return "WSAENOPROTOOPT";
+        result = "WSAENOPROTOOPT";
+        break;
     case 10043:
-        return "WSAEPROTONOSUPPORT";
+        result = "WSAEPROTONOSUPPORT";
+        break;
     case 10044:
-        return "WSAESOCKTNOSUPPORT";
+        result = "WSAESOCKTNOSUPPORT";
+        break;
     case 10045:
-        return "WSAEOPNOTSUPP";
+        result = "WSAEOPNOTSUPP";
+        break;
     case 10046:
-        return "WSAEPFNOSUPPORT";
+        result = "WSAEPFNOSUPPORT";
+        break;
     case 10047:
-        return "WSAEAFNOSUPPORT";
+        result = "WSAEAFNOSUPPORT";
+        break;
     case 10048:
-        return "WSAEADDRINUSE";
+        result = "WSAEADDRINUSE";
+        break;
     case 10049:
-        return "WSAEADDRNOTAVAIL";
+        result = "WSAEADDRNOTAVAIL";
+        break;
     case 10050:
-        return "WSAENETDOWN";
+        result = "WSAENETDOWN";
+        break;
     case 10051:
-        return "WSAENETUNREACH";
+        result = "WSAENETUNREACH";
+        break;
     case 10052:
-        return "WSAENETRESET";
+        result = "WSAENETRESET";
+        break;
     case 10053:
-        return "WSAECONNABORTED";
+        result = "WSAECONNABORTED";
+        break;
     case 10054:
-        return "WSAECONNRESET";
+        result = "WSAECONNRESET";
+        break;
     case 10056:
-        return "WSAEISCONN";
+        result = "WSAEISCONN";
+        break;
     case 10057:
-        return "WSAENOTCONN";
+        result = "WSAENOTCONN";
+        break;
     case 10058:
-        return "WSAESHUTDOWN";
+        result = "WSAESHUTDOWN";
+        break;
     case 10059:
-        return "WSAETOOMANYREFS";
+        result = "WSAETOOMANYREFS";
+        break;
     case 10060:
-        return "WSAETIMEDOUT";
+        result = "WSAETIMEDOUT";
+        break;
     case 10061:
-        return "WSAECONNREFUSED";
+        result = "WSAECONNREFUSED";
+        break;
     case 10062:
-        return "WSAELOOP";
+        result = "WSAELOOP";
+        break;
     case 10063:
-        return "WSAENAMETOOLONG";
+        result = "WSAENAMETOOLONG";
+        break;
     case 10064:
-        return "WSAEHOSTDOWN";
+        result = "WSAEHOSTDOWN";
+        break;
     case 10065:
-        return "WSAEHOSTUNREACH";
+        result = "WSAEHOSTUNREACH";
+        break;
     case 10066:
-        return "WSAENOTEMPTY";
+        result = "WSAENOTEMPTY";
+        break;
     case 10067:
-        return "WSAEPROCLIM";
+        result = "WSAEPROCLIM";
+        break;
     case 10068:
-        return "WSAEUSERS";
+        result = "WSAEUSERS";
+        break;
     case 10069:
-        return "WSAEDQUOT";
+        result = "WSAEDQUOT";
+        break;
     case 10070:
-        return "WSAESTALE";
+        result = "WSAESTALE";
+        break;
     case 10071:
-        return "WSAEREMOTE";
+        result = "WSAEREMOTE";
+        break;
     case 10091:
-        return "WSASYSNOTREADY";
+        result = "WSASYSNOTREADY";
+        break;
     case 10092:
-        return "WSAVERNOTSUPPORTED";
+        result = "WSAVERNOTSUPPORTED";
+        break;
     case 10093:
-        return "WSANOTINITIALISED";
+        result = "WSANOTINITIALISED";
+        break;
     case 10101:
-        return "WSAEDISCON";
+        result = "WSAEDISCON";
+        break;
+#if defined(RDPLIB_SOURCE_FAITHFUL) && !defined(_WIN32)
+    // Mac clients extend the canonical table with these entries.
+    case 10102:
+        result = "WSAENOMORE";
+        break;
+    case 10103:
+        result = "WSAECANCELLED";
+        break;
+    case 10104:
+        result = "WSAEINVALIDPROCTABLE";
+        break;
+    case 10105:
+        result = "WSAEINVALIDPROVIDER";
+        break;
+    case 10106:
+        result = "WSAEPROVIDERFAILEDINIT";
+        break;
+    case 10107:
+        result = "WSASYSCALLFAILURE";
+        break;
+    case 10108:
+        result = "WSASERVICE_NOT_FOUND";
+        break;
+    case 10109:
+        result = "WSATYPE_NOT_FOUND";
+        break;
+    case 10110:
+        result = "WSA_E_NO_MORE";
+        break;
+    case 10111:
+        result = "WSA_E_CANCELLED";
+        break;
+    case 10112:
+        result = "WSAEREFUSED";
+        break;
+#endif
     case 11001:
-        return "WSAHOST_NOT_FOUND";
+        result = "WSAHOST_NOT_FOUND";
+        break;
     case 11002:
-        return "WSATRY_AGAIN";
+        result = "WSATRY_AGAIN";
+        break;
     case 11003:
-        return "WSANO_RECOVERY";
+        result = "WSANO_RECOVERY";
+        break;
     case 11004:
-        return "WSANO_DATA";
+        result = "WSANO_DATA";
+        break;
     default:
+#if defined(RDPLIB_SOURCE_FAITHFUL) && !defined(_WIN32) && !defined(__powerpc__) && !defined(__ppc__) && !defined(_M_PPC)
+        // PowerPC Mac uses %u; Intel Mac uses %lu.
+        sprintf(net_error_string, "%lu", (unsigned long)error_number);
+#else
+        sprintf(net_error_string, "%u", error_number);
+#endif
         break;
     }
+    return result;
+}
 
-    // These names exist in both Mac binaries but are absent from the TAKP Windows switch.
-    if (include_provider_errors)
+#ifdef RDP_DEAD_CODE
+char *net_strerror_mac(uint32_t error_number)
+{
+    switch (error_number)
     {
-        switch (error)
-        {
-        case 10102:
-            return "WSAENOMORE";
-        case 10103:
-            return "WSAECANCELLED";
-        case 10104:
-            return "WSAEINVALIDPROCTABLE";
-        case 10105:
-            return "WSAEINVALIDPROVIDER";
-        case 10106:
-            return "WSAEPROVIDERFAILEDINIT";
-        case 10107:
-            return "WSASYSCALLFAILURE";
-        case 10108:
-            return "WSASERVICE_NOT_FOUND";
-        case 10109:
-            return "WSATYPE_NOT_FOUND";
-        case 10110:
-            return "WSA_E_NO_MORE";
-        case 10111:
-            return "WSA_E_CANCELLED";
-        case 10112:
-            return "WSAEREFUSED";
-        default:
-            break;
-        }
+    case 10102:
+        return "WSAENOMORE";
+    case 10103:
+        return "WSAECANCELLED";
+    case 10104:
+        return "WSAEINVALIDPROCTABLE";
+    case 10105:
+        return "WSAEINVALIDPROVIDER";
+    case 10106:
+        return "WSAEPROVIDERFAILEDINIT";
+    case 10107:
+        return "WSASYSCALLFAILURE";
+    case 10108:
+        return "WSASERVICE_NOT_FOUND";
+    case 10109:
+        return "WSATYPE_NOT_FOUND";
+    case 10110:
+        return "WSA_E_NO_MORE";
+    case 10111:
+        return "WSA_E_CANCELLED";
+    case 10112:
+        return "WSAEREFUSED";
+    default:
+        return net_strerror(error_number);
     }
-
-    // The clients use sprintf into a process global 64 byte buffer. A uint32_t always fits,
-    // but another call overwrites the returned text and concurrent calls race.
-    sprintf(unknown_error, "%u", error);
-    return unknown_error;
 }
+#endif
 
-const char *rdp_net_strerror_mac(uint32_t error)
-{
-    static char unknown_error[64];
-    return net_strerror_common(error, 1, unknown_error);
-}
+#else
 
-const char *rdp_net_strerror_windows(uint32_t error)
-{
-    static char unknown_error[64];
-    return net_strerror_common(error, 0, unknown_error);
-}
+typedef int rdplib_ustrerror_disabled_translation_unit;
+
+#endif /* RDPLIB_DEBUG || RDPLIB_SOURCE_FAITHFUL || RDP_DEAD_CODE */

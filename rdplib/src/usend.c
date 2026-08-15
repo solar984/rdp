@@ -3,121 +3,250 @@
 
 #include "usend.h"
 
+#ifdef RDPLIB_DEBUG
+#include <assert.h>
+#endif
 #include <stdlib.h>
 #include <string.h>
 
 #ifndef RDPLIB_SOURCE_FAITHFUL
 #include "connection.h"
 #endif
-#include "framing.h"
+#include "crc.h"
+#include "cypher.h"
 #include "rdplib_platform.h"
+
+#define BLOCKSIZE 8
+#define USEND_MAX_SIZE 32768
 
 enum
 {
-    RDP_USEND_STACK_BYTES = 32768,
     RDP_USEND_WOULD_BLOCK = 10035,
     RDP_USEND_INVALID_ARGUMENT = 6,
     RDP_USEND_CAPACITY_EXCEEDED = 18
 };
 
-#ifdef RDPLIB_SOURCE_FAITHFUL
-int usend(intptr_t endpoint, const rdp_buffer_t *buffers, uint32_t buffer_count, const uint8_t destination[16], int use_encryption, int use_crc)
-#else
-static int rdplib_usend_internal(struct connection_t *connection, intptr_t endpoint, const rdp_buffer_t *buffers, uint32_t buffer_count, const uint8_t destination[16], int use_encryption, int use_crc)
+#ifndef RDPLIB_SOURCE_FAITHFUL
+static uint32_t rdplib_usend_validate(iov_t *iov, uint32_t iov_len, struct sockaddr *remote_addr, uint32_t encrypt, uint32_t crc, uint32_t *buffer_size);
+static uint32_t rdplib_usend_send_joined(intptr_t socket, char *buffer, int32_t buffer_size, struct sockaddr *remote_addr, uint32_t encrypt, uint32_t crc);
+static uint32_t rdplib_usend_with_callback(connection_t *connection, intptr_t socket, iov_t *iov, uint32_t iov_len, struct sockaddr *remote_addr, uint32_t encrypt, uint32_t crc, uint32_t buffer_size);
 #endif
+
+int32_t rdp_append_crc(char *buffer, int32_t buffer_size)
 {
-    uint8_t packet[RDP_USEND_STACK_BYTES];
-    uint32_t network_crc;
-    uint32_t packet_bytes = 0;
-    uint32_t unpadded_bytes;
-    uint32_t padded_bytes;
-    uint32_t index;
-    int32_t sent_bytes;
+    uint32_t crc;
+
+    crc = htonl(rdp_crc(0, buffer, (uint32_t)buffer_size));
+    memcpy(buffer + buffer_size, &crc, sizeof(crc));
+    buffer_size += (int32_t)sizeof(crc);
+    return buffer_size;
+}
+
+int32_t rdp_encode_data(char *buffer, int32_t buffer_size)
+{
+    int32_t original_size;
+    int32_t i;
+    uint8_t pad_size;
+
+    original_size = buffer_size;
+    buffer_size = (buffer_size + BLOCKSIZE) & ~(BLOCKSIZE - 1);
+    for (i = original_size; i < buffer_size; ++i)
+    {
+        buffer[i] = (char)rand();
+    }
+
+#ifdef RDPLIB_DEBUG
+    assert(buffer_size - original_size <= BLOCKSIZE);
+#endif
+    pad_size = (uint8_t)(buffer_size - original_size);
+    buffer[buffer_size - 1] = (char)((buffer[buffer_size - 1] & 0xf0) | pad_size);
+
+    // The May 2002 debug self check uses fixed 600 byte locals and is unsafe
+    // for larger encoded buffers. Retail clients retain only the encode call.
+#ifdef RDPLIB_DEBUG
+    {
+        char plain[600];
+        char cypher[600];
+
+        memcpy(plain, buffer, buffer_size);
+        rdp_encode(plain, buffer_size / BLOCKSIZE);
+        memcpy(cypher, plain, buffer_size);
+        rdp_decode(plain, buffer_size / BLOCKSIZE);
+        assert(0 == memcmp( plain, buffer, buffer_size ));
+        memcpy(buffer, cypher, buffer_size);
+    }
+#else
+    rdp_encode(buffer, buffer_size / BLOCKSIZE);
+#endif
+    return buffer_size;
+}
+
+uint32_t usend(intptr_t socket, iov_t *iov, uint32_t iov_len, struct sockaddr *remote_addr, uint32_t encrypt, uint32_t crc)
+{
+    int32_t buffer_size;
+    char buffer[USEND_MAX_SIZE];
+    uint32_t i;
+    int32_t char_sent;
+    uint32_t result;
+
+    buffer_size = 0;
+    result = 0;
 
 #ifndef RDPLIB_SOURCE_FAITHFUL
     {
-        uint32_t validated_bytes = 0;
-        uint32_t framed_bytes;
+        uint32_t checked_buffer_size;
 
-        if ((!buffers && buffer_count != 0) || !destination)
+        result = rdplib_usend_validate(iov, iov_len, remote_addr, encrypt, crc, &checked_buffer_size);
+        if (result)
+        {
+            return result;
+        }
+    }
+#endif
+
+    for (i = 0; i < iov_len; ++i)
+    {
+#ifdef RDPLIB_DEBUG
+        assert(buffer_size+iov[i].size < USEND_MAX_SIZE);
+#endif
+#ifndef RDPLIB_SOURCE_FAITHFUL
+        if (iov[i].size == 0)
+        {
+            continue;
+        }
+#endif
+        memcpy(buffer + buffer_size, iov[i].data, iov[i].size);
+        buffer_size += (int32_t)iov[i].size;
+    }
+
+    if (crc || encrypt)
+    {
+        buffer_size = rdp_append_crc(buffer, buffer_size);
+    }
+    if (encrypt)
+    {
+        buffer_size = rdp_encode_data(buffer, buffer_size);
+    }
+
+    char_sent = rdplib_platform_send_datagram(socket, (const uint8_t *)buffer, (uint32_t)buffer_size, (const uint8_t *)remote_addr);
+    if (char_sent != buffer_size)
+    {
+        if (rdplib_platform_last_socket_error() == RDP_USEND_WOULD_BLOCK)
+        {
+            result = 5;
+        }
+        else
+        {
+            result = 1;
+        }
+    }
+    return result;
+}
+
+#ifndef RDPLIB_SOURCE_FAITHFUL
+static uint32_t rdplib_usend_validate(iov_t *iov, uint32_t iov_len, struct sockaddr *remote_addr, uint32_t encrypt, uint32_t crc, uint32_t *buffer_size)
+{
+    uint32_t framed_size;
+    uint32_t i;
+
+    if ((!iov && iov_len != 0) || !remote_addr || !buffer_size)
+    {
+        return RDP_USEND_INVALID_ARGUMENT;
+    }
+
+    *buffer_size = 0;
+    for (i = 0; i < iov_len; ++i)
+    {
+        if (!iov[i].data && iov[i].size != 0)
         {
             return RDP_USEND_INVALID_ARGUMENT;
         }
-        for (index = 0; index < buffer_count; ++index)
+        if (iov[i].size > USEND_MAX_SIZE - *buffer_size)
         {
-            if ((!buffers[index].data && buffers[index].bytes != 0) || buffers[index].bytes > RDP_USEND_STACK_BYTES - validated_bytes)
-            {
-                return buffers[index].data || buffers[index].bytes == 0 ? RDP_USEND_CAPACITY_EXCEEDED : RDP_USEND_INVALID_ARGUMENT;
-            }
-            validated_bytes += buffers[index].bytes;
+            return RDP_USEND_CAPACITY_EXCEEDED;
         }
+        *buffer_size += iov[i].size;
+    }
 
-        framed_bytes = validated_bytes;
-        if (use_encryption || use_crc)
+    framed_size = *buffer_size;
+    if (crc || encrypt)
+    {
+        if (framed_size > USEND_MAX_SIZE - sizeof(uint32_t))
         {
-            if (framed_bytes > RDP_USEND_STACK_BYTES - sizeof(uint32_t))
-            {
-                return RDP_USEND_CAPACITY_EXCEEDED;
-            }
-            framed_bytes += sizeof(uint32_t);
+            return RDP_USEND_CAPACITY_EXCEEDED;
         }
-        if (use_encryption && (framed_bytes > RDP_USEND_STACK_BYTES - 8u || ((framed_bytes + 8u) & ~UINT32_C(7)) > RDP_USEND_STACK_BYTES))
+        framed_size += sizeof(uint32_t);
+    }
+    if (encrypt)
+    {
+        framed_size = (framed_size + BLOCKSIZE) & ~(uint32_t)(BLOCKSIZE - 1);
+        if (framed_size > USEND_MAX_SIZE)
         {
             return RDP_USEND_CAPACITY_EXCEEDED;
         }
     }
-#endif
+    return 0;
+}
 
-    for (index = 0; index < buffer_count; ++index)
+static uint32_t rdplib_usend_send_joined(intptr_t socket, char *buffer, int32_t buffer_size, struct sockaddr *remote_addr, uint32_t encrypt, uint32_t crc)
+{
+    int32_t char_sent;
+
+    if (crc || encrypt)
     {
-        memcpy(packet + packet_bytes, buffers[index].data, buffers[index].bytes);
-        packet_bytes += buffers[index].bytes;
+        buffer_size = rdp_append_crc(buffer, buffer_size);
+    }
+    if (encrypt)
+    {
+        buffer_size = rdp_encode_data(buffer, buffer_size);
     }
 
-#ifndef RDPLIB_SOURCE_FAITHFUL
-    if (connection && connection->rdplib_packet_drop_callback &&
-        connection->rdplib_packet_drop_callback(connection->rdplib_packet_drop_context, RDPLIB_PACKET_DROP_OUTBOUND, packet, packet_bytes))
+    char_sent = rdplib_platform_send_datagram(socket, (const uint8_t *)buffer, (uint32_t)buffer_size, (const uint8_t *)remote_addr);
+    if (char_sent != buffer_size)
     {
-        return 0;
-    }
-#endif
-
-    if (use_encryption || use_crc)
-    {
-        network_crc = htonl(rdp_crc(0, packet, packet_bytes));
-        memcpy(packet + packet_bytes, &network_crc, sizeof(network_crc));
-        packet_bytes += sizeof(network_crc);
-    }
-
-    if (use_encryption)
-    {
-        unpadded_bytes = packet_bytes;
-        padded_bytes = (packet_bytes + 8u) & ~UINT32_C(7);
-        while (packet_bytes < padded_bytes)
-        {
-            packet[packet_bytes++] = (uint8_t)rand();
-        }
-        packet[padded_bytes - 1u] = (uint8_t)((packet[padded_bytes - 1u] & 0xF0u) | (padded_bytes - unpadded_bytes));
-        rdp_encode(packet, (int)(padded_bytes / 8u));
-        packet_bytes = padded_bytes;
-    }
-
-    sent_bytes = rdplib_platform_send_datagram(endpoint, packet, packet_bytes, destination);
-    if (sent_bytes != (int32_t)packet_bytes)
-    {
-        return rdplib_platform_last_socket_error() == RDP_USEND_WOULD_BLOCK ? 5 : 1;
+        return rdplib_platform_last_socket_error() == RDP_USEND_WOULD_BLOCK ? 5u : 1u;
     }
     return 0;
 }
 
-#ifndef RDPLIB_SOURCE_FAITHFUL
-int usend(intptr_t endpoint, const rdp_buffer_t *buffers, uint32_t buffer_count, const uint8_t destination[16], int use_encryption, int use_crc)
+static uint32_t rdplib_usend_with_callback(connection_t *connection, intptr_t socket, iov_t *iov, uint32_t iov_len, struct sockaddr *remote_addr, uint32_t encrypt, uint32_t crc, uint32_t buffer_size)
 {
-    return rdplib_usend_internal(NULL, endpoint, buffers, buffer_count, destination, use_encryption, use_crc);
+    char buffer[USEND_MAX_SIZE];
+    uint32_t copied_size;
+    uint32_t i;
+
+    copied_size = 0;
+    for (i = 0; i < iov_len; ++i)
+    {
+        if (iov[i].size != 0)
+        {
+            memcpy(buffer + copied_size, iov[i].data, iov[i].size);
+            copied_size += iov[i].size;
+        }
+    }
+    if (connection->rdplib_packet_drop_callback(connection->rdplib_packet_drop_context, RDPLIB_PACKET_DROP_OUTBOUND, (const uint8_t *)buffer, buffer_size))
+    {
+        return 0;
+    }
+    return rdplib_usend_send_joined(socket, buffer, (int32_t)buffer_size, remote_addr, encrypt, crc);
 }
 
-int rdplib_usend(struct connection_t *connection, intptr_t endpoint, const rdp_buffer_t *buffers, uint32_t buffer_count, const uint8_t destination[16], int use_encryption, int use_crc)
+uint32_t rdplib_usend(connection_t *connection, intptr_t socket, iov_t *iov, uint32_t iov_len, struct sockaddr *remote_addr, uint32_t encrypt, uint32_t crc)
 {
-    return rdplib_usend_internal(connection, endpoint, buffers, buffer_count, destination, use_encryption, use_crc);
+    uint32_t buffer_size;
+    uint32_t result;
+
+    result = rdplib_usend_validate(iov, iov_len, remote_addr, encrypt, crc, &buffer_size);
+    if (result)
+    {
+        return result;
+    }
+
+    if (connection && connection->rdplib_packet_drop_callback)
+    {
+        return rdplib_usend_with_callback(connection, socket, iov, iov_len, remote_addr, encrypt, crc, buffer_size);
+    }
+
+    return usend(socket, iov, iov_len, remote_addr, encrypt, crc);
 }
 #endif

@@ -1,99 +1,125 @@
 // Copyright (c) 2026 solar@heliacal.net
 // SPDX-License-Identifier: MIT
 
-#include "packet.h"
+#include "msg_arrival.h"
 
 #include <string.h>
 
+#include "packet.h"
 #include "rdplib_constants.h"
 
-void msg_arrival_init(msg_arrival_t *message, uint16_t fragment_id)
+void msg_arrival_init(msg_arrival_t *arrival, uint16_t fragid)
 {
-    message->link.value = message;
-    message->link.key = &message->fragment_id;
-    message->sender_connection = NULL;
-    message->fragment_id = fragment_id;
-    message->fragments_received = 0;
+    arrival->rxq_link.item = arrival;
+    arrival->rxq_link.key.p = &arrival->fragid;
+    arrival->fragments_collected = 0;
+    arrival->fragid = fragid;
+    arrival->sender = NULL;
 }
 
-void msg_arrival_prepare_for_sequencer(msg_arrival_t *message)
+void msg_arrival_prepare_for_sequencer(msg_arrival_t *arrival)
 {
-    message->link.key = &message->stream_sequence;
+    arrival->rxq_link.key.p = &arrival->stream_seqnum;
 }
 
-void msg_arrival_prepare_for_rxq(msg_arrival_t *message)
+void msg_arrival_prepare_for_rxq(msg_arrival_t *arrival)
 {
-    message->link.key = NULL;
+    arrival->rxq_link.key.p = NULL;
 }
 
-int msg_arrival_assemble(msg_arrival_t *message, void *sender_connection, const _rdp_header_t *header, const void *payload)
+uint32_t msg_arrival_assemble(msg_arrival_t *arrival, connection_t *sender, rdp_header_t *header, char *data)
 {
-    uint32_t payload_offset;
+    char *dst;
 
-    if (header->fragment_index == 0)
+#ifndef RDPLIB_SOURCE_FAITHFUL
+    // The original waits for fragment zero before recording the group geometry. Binding it to the first fragment prevents a later fragment zero from enlarging the allocation's declared extent.
+    if (arrival->fragments_collected == 0 && header->frag_number != 0)
     {
-        message->flags = header->flags;
-        message->sequence = header->sequence;
-        message->message_id = header->message_id;
-        message->fragment_count = header->fragment_count;
-        message->stream_id = header->stream_id;
-        message->stream_sequence = header->stream_sequence;
-        message->sender_connection = sender_connection;
+        arrival->frag_total = header->frag_total;
+        arrival->msgid = (uint16_t)(header->msgid - header->frag_number);
+    }
+#endif
+
+    if (header->frag_number == 0)
+    {
+        arrival->options = header->options;
+        arrival->seqnum = header->seqnum;
+        arrival->msgid = header->msgid;
+        arrival->frag_total = header->frag_total;
+        arrival->stream = header->stream;
+        arrival->stream_seqnum = header->stream_seqnum;
+        arrival->sender = sender;
     }
 
-    ++message->fragments_received;
-    payload_offset = (uint32_t)header->fragment_index * RDP_FRAGMENT_PAYLOAD_BYTES;
-    memcpy((uint8_t *)(message + 1) + payload_offset, payload, header->payload_bytes);
+    ++arrival->fragments_collected;
+    dst = (char *)(arrival + 1) + RDP_FRAGMENT_PAYLOAD_BYTES * header->frag_number;
+    memcpy(dst, data, header->data_size);
 
-    if ((uint16_t)(header->fragment_index + 1u) == header->fragment_count)
+    if (header->frag_number + 1u == header->frag_total)
     {
-        message->payload_bytes = payload_offset + header->payload_bytes;
+        arrival->size = RDP_FRAGMENT_PAYLOAD_BYTES * header->frag_number + header->data_size;
     }
 
-    return message->fragments_received == header->fragment_count;
+    return header->frag_total == arrival->fragments_collected;
 }
 
-void msg_arrival_init_disconnect_msg(msg_arrival_t *message, void *sender_connection)
+void msg_arrival_init_disconnect_msg(msg_arrival_t *arrival, connection_t *sender)
 {
-    memset(message, 0, sizeof(*message));
-    message->link.value = message;
-    message->sender_connection = sender_connection;
+    memset(arrival, 0, sizeof(*arrival));
+    arrival->rxq_link.item = arrival;
+    arrival->rxq_link.key.p = NULL;
+    arrival->sender = sender;
 }
 
-int msg_arrival_validate_fragment_arrival(const msg_arrival_t *message, const _rdp_header_t *header)
+uint32_t msg_arrival_validate_fragment_arrival(msg_arrival_t *arrival, rdp_header_t *header)
 {
-    uint16_t expected_message_id;
+    uint32_t validate;
+    uint16_t msgid;
 
-    if (!message->sender_connection)
+    validate = 0;
+#ifdef RDPLIB_SOURCE_FAITHFUL
+    msgid = (uint16_t)(arrival->msgid + header->frag_number);
+    if (arrival->sender && (arrival->frag_total != header->frag_total || msgid != header->msgid))
     {
-        return 0;
+        validate = 2;
     }
-
-    expected_message_id = (uint16_t)(message->message_id + header->fragment_index);
-    if (message->fragment_count != header->fragment_count || expected_message_id != header->message_id)
+#else
+    if (arrival->fragments_collected != 0)
     {
-        return 2;
+        msgid = (uint16_t)(arrival->msgid + header->frag_number);
+        if (arrival->frag_total != header->frag_total || msgid != header->msgid)
+        {
+            validate = 2;
+        }
     }
-
-    return 0;
+#endif
+    return validate;
 }
 
-uint32_t msg_arrival_get_size(const msg_arrival_t *message)
+uint32_t msg_arrival_get_size(const msg_arrival_t *arrival)
 {
-    return message->payload_bytes;
+    return arrival->size;
 }
 
-uint8_t *msg_arrival_get_data(msg_arrival_t *message)
+char *msg_arrival_get_data(const msg_arrival_t *arrival)
 {
-    return msg_arrival_data(message);
+    return arrival->size ? (char *)(arrival + 1) : NULL;
 }
 
-void *msg_arrival_get_sender(const msg_arrival_t *message)
+connection_t *msg_arrival_get_sender(const msg_arrival_t *arrival)
 {
-    return message->sender_connection;
+    return arrival->sender;
 }
 
-int msg_arrival_has_fin(const msg_arrival_t *message)
+#ifdef RDP_DEAD_CODE
+// unused, retained for historical interest
+struct sockaddr *msg_arrival_get_sender_addr(msg_arrival_t *arrival)
 {
-    return (message->flags & RDP_FLAG_FIN) != 0;
+    return arrival->sender ? NULL : &arrival->from;
+}
+#endif
+
+uint32_t msg_arrival_has_fin(const msg_arrival_t *arrival)
+{
+    return (arrival->options & RDP_FLAG_FIN) != 0;
 }

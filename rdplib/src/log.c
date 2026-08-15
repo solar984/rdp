@@ -1,42 +1,72 @@
 // Copyright (c) 2026 solar@heliacal.net
 // SPDX-License-Identifier: MIT
 
-#ifdef _MSC_VER
+#if defined(_MSC_VER) && defined(RDPLIB_SOURCE_FAITHFUL)
 #define _CRT_SECURE_NO_WARNINGS
 #endif
 
-#include "net_error.h"
+#include "log.h"
+
+#ifdef RDPLIB_SOURCE_FAITHFUL
 
 #include <stdarg.h>
-#include <stdio.h>
-#include <time.h>
 
-// This was recovered from the clients but we omit the original call sites so this is essentially dead code just here for historical interest.
-void discard_log_append(const char *format, ...)
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include "rdplib_log.h"
+#endif
+
+void time_format(char *time_text)
 {
-    static FILE *discard_log;
-    char timestamp[40];
-    struct tm *local;
-    time_t now;
-    va_list arguments;
+#ifdef _WIN32
+    SYSTEMTIME t;
 
-    if (!discard_log)
-    {
-        discard_log = fopen("Logs:discard.log", "a");
-    }
-    if (!discard_log)
-    {
-        return;
-    }
+    GetSystemTime(&t);
+    sprintf(time_text, "[%02u/%02u/%02u %02u:%02u:%02u] ", t.wMonth, t.wDay, t.wYear % 100, t.wHour, t.wMinute, t.wSecond);
+#else
+    rdplib_log_system_time_t t;
 
-    now = time(NULL);
-    local = localtime(&now);
-    sprintf(timestamp, "[%02u/%02u/%02u %02u:%02u:%02u] ", (uint32_t)local->tm_mon + 1u, (uint32_t)local->tm_mday, (uint32_t)(local->tm_year % 100), (uint32_t)local->tm_hour, (uint32_t)local->tm_min,
-            (uint32_t)local->tm_sec);
-    fputs(timestamp, discard_log);
-
-    va_start(arguments, format);
-    vfprintf(discard_log, format, arguments);
-    va_end(arguments);
-    fflush(discard_log);
+    rdplib_log_get_system_time(&t);
+    sprintf(time_text, "[%02u/%02u/%02u %02u:%02u:%02u] ", (unsigned)t.month, (unsigned)t.day, (unsigned)(t.year % 100), (unsigned)t.hour, (unsigned)t.minute, (unsigned)t.second);
+#endif
 }
+
+void ftimeprint(FILE *file)
+{
+    char time_text[21];
+
+    time_format(time_text);
+    fprintf(file, time_text);
+}
+
+void discard_log_append(char *fmt, ...)
+{
+    static FILE *s_discard_log;
+
+#ifdef _WIN32
+    if (!s_discard_log)
+        s_discard_log = fopen("discard.log", "a");
+#else
+    // Mac clients use the HFS path below.
+    if (!s_discard_log)
+        s_discard_log = fopen("Logs:discard.log", "a");
+#endif
+    if (s_discard_log)
+    {
+        va_list varg;
+
+        ftimeprint(s_discard_log);
+        va_start(varg, fmt);
+        vfprintf(s_discard_log, fmt, varg);
+        va_end(varg);
+        fflush(s_discard_log);
+    }
+}
+
+#endif /* RDPLIB_SOURCE_FAITHFUL */
+
+#ifndef RDPLIB_SOURCE_FAITHFUL
+// suppress MSVC warning C4206 when this file becomes empty in a normal build
+typedef int rdplib_log_disabled_translation_unit;
+#endif

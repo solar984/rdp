@@ -5,12 +5,12 @@
 
 #include <fcntl.h>
 
-int rdplib_platform_socket_disable_blocking(intptr_t endpoint)
+uint32_t disable_blocking(intptr_t s)
 {
-    int flags = fcntl((int)endpoint, F_GETFL, 0);
-    if (flags < 0 || fcntl((int)endpoint, F_SETFL, flags | O_NONBLOCK) != 0)
-    {
-        return 1;
-    }
-    return 0;
+    int flags;
+    int result;
+
+    flags = fcntl((int)s, F_GETFL, 0);
+    result = flags < 0 ? -1 : fcntl((int)s, F_SETFL, flags | O_NONBLOCK);
+    return result != 0;
 }

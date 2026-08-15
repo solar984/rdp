@@ -1,158 +1,223 @@
 // Copyright (c) 2026 solar@heliacal.net
 // SPDX-License-Identifier: MIT
 
-#include "container.h"
+#include "pqueue.h"
 
+#ifdef RDPLIB_DEBUG
+#include <assert.h>
+#endif
 #include <stdlib.h>
 
-static void pqueue_swap(rdp_pqueue_t *queue, uint32_t left, uint32_t right)
+static void pqueue_resort_index(pqueue_t *q, uint32_t element);
+static void *pqueue_remove_index(pqueue_t *q, uint32_t element);
+static void pqueue_siftup(pqueue_t *q, uint32_t element);
+static void pqueue_siftdown(pqueue_t *q, uint32_t parent);
+
+uint32_t pqueue_create(pqueue_t *q, uint32_t grow_size, keycmp_f keycmp)
 {
-    rdp_pqueue_link_t *temporary = queue->items[left];
-    queue->items[left] = queue->items[right];
-    queue->items[right] = temporary;
-    queue->items[left]->heap_index = left;
-    queue->items[right]->heap_index = right;
+    uint32_t result;
+
+    result = 0;
+    q->grow_size = grow_size;
+    q->next_element = 0;
+    q->array_size = grow_size;
+    q->keycmp = keycmp;
+    q->array = (qlink **)malloc(sizeof(*q->array) * q->grow_size);
+#ifdef RDPLIB_DEBUG
+    assert(q->array != NULL);
+#endif
+    if (q->array == NULL)
+    {
+        result = 1;
+    }
+    return result;
 }
 
-static void pqueue_siftup(rdp_pqueue_t *queue, uint32_t index)
+void pqueue_destroy(pqueue_t *q)
 {
-    while (index)
+#ifdef RDPLIB_DEBUG
+    assert(q->next_element == 0);
+#endif
+    if (q->array)
     {
-        uint32_t parent = (index - 1u) >> 1;
-        if (queue->compare(queue->items[index]->key, queue->items[parent]->key) >= 0)
+        free(q->array);
+        q->array = NULL;
+    }
+}
+
+#ifdef RDP_DEAD_CODE
+// unused, retained for historical interest
+uint32_t pqueue_get_size(pqueue_t *q)
+{
+    return q->next_element;
+}
+#endif
+
+static void pqueue_resort_index(pqueue_t *q, uint32_t element)
+{
+#ifdef RDPLIB_DEBUG
+    assert(element < q->next_element);
+#endif
+    pqueue_siftup(q, element);
+    pqueue_siftdown(q, element);
+}
+
+static void *pqueue_remove_index(pqueue_t *q, uint32_t element)
+{
+    void *item;
+
+#ifdef RDPLIB_DEBUG
+    assert(element < q->next_element);
+#endif
+    item = q->array[element]->item;
+    --q->next_element;
+    if (q->next_element != element)
+    {
+        q->array[element] = q->array[q->next_element];
+        q->array[element]->index = element;
+        pqueue_siftdown(q, element);
+        pqueue_siftup(q, element);
+    }
+    return item;
+}
+
+static void pqueue_siftup(pqueue_t *q, uint32_t element)
+{
+    uint32_t parent;
+    qlink *tmp_link;
+
+    while (element)
+    {
+        parent = (element - 1u) >> 1;
+        if (q->keycmp(q->array[element]->key.p, q->array[parent]->key.p) >= 0)
         {
             break;
         }
 
-        pqueue_swap(queue, index, parent);
-        index = parent;
+        tmp_link = q->array[element];
+        q->array[element] = q->array[parent];
+        q->array[parent] = tmp_link;
+        q->array[element]->index = element;
+        q->array[parent]->index = parent;
+        element = parent;
     }
 }
 
-int pqueue_create(rdp_pqueue_t *queue, uint32_t initial_capacity, rdp_container_compare_t compare)
+static void pqueue_siftdown(pqueue_t *q, uint32_t parent)
 {
-    queue->count = 0;
-    queue->capacity = initial_capacity;
-    queue->growth = initial_capacity;
-    queue->compare = compare;
-    queue->items = (rdp_pqueue_link_t **)malloc((size_t)initial_capacity * sizeof(*queue->items));
-    return queue->items ? 0 : 1;
-}
+    uint32_t swap_element;
+    int right_cmp;
+    qlink *tmp_link;
+    int left_right_cmp;
+    uint32_t right_child;
+    uint32_t left_child;
+    int left_cmp;
 
-void pqueue_destroy(rdp_pqueue_t *queue)
-{
-    if (queue->items)
-    {
-        free(queue->items);
-        queue->items = NULL;
-    }
-}
-
-int pqueue_insert(rdp_pqueue_t *queue, rdp_pqueue_link_t *link)
-{
-    uint32_t index;
-
-    if (queue->count == queue->capacity)
-    {
-        uint32_t capacity = queue->capacity + queue->growth;
-        rdp_pqueue_link_t **items = (rdp_pqueue_link_t **)realloc(queue->items, (size_t)capacity * sizeof(*queue->items));
-        if (!items)
-        {
-            return 1;
-        }
-
-        queue->items = items;
-        queue->capacity = capacity;
-    }
-
-    index = queue->count;
-    queue->items[index] = link;
-    link->heap_index = index;
-    pqueue_siftup(queue, index);
-    ++queue->count;
-    return 0;
-}
-
-void pqueue_siftdown(rdp_pqueue_t *queue, uint32_t index)
-{
     for (;;)
     {
-        uint32_t left = index * 2u + 1u;
-        uint32_t right = left + 1u;
-        uint32_t smaller;
+        left_child = 2u * parent + 1u;
+        right_child = 2u * parent + 2u;
+        if (left_child >= q->next_element)
+        {
+            break;
+        }
 
-        if (left >= queue->count)
+        left_cmp = q->keycmp(q->array[parent]->key.p, q->array[left_child]->key.p);
+        if (right_child >= q->next_element)
+        {
+            if (left_cmp > 0)
+            {
+                tmp_link = q->array[parent];
+                q->array[parent] = q->array[left_child];
+                q->array[left_child] = tmp_link;
+                q->array[parent]->index = parent;
+                q->array[left_child]->index = left_child;
+            }
+            return;
+        }
+
+        right_cmp = q->keycmp(q->array[parent]->key.p, q->array[right_child]->key.p);
+        if (left_cmp <= 0 && right_cmp <= 0)
         {
             return;
         }
 
-        if (right < queue->count && queue->compare(queue->items[left]->key, queue->items[right]->key) >= 0)
+        left_right_cmp = q->keycmp(q->array[left_child]->key.p, q->array[right_child]->key.p);
+        if (left_right_cmp < 0)
         {
-            smaller = right; // Equal children select the right child in all 3 clients.
+            swap_element = left_child;
         }
         else
         {
-            smaller = left;
+            swap_element = right_child;
         }
 
-        if (queue->compare(queue->items[index]->key, queue->items[smaller]->key) <= 0)
+        tmp_link = q->array[parent];
+        q->array[parent] = q->array[swap_element];
+        q->array[swap_element] = tmp_link;
+        q->array[parent]->index = parent;
+        q->array[swap_element]->index = swap_element;
+        parent = swap_element;
+    }
+}
+
+uint32_t pqueue_insert(pqueue_t *q, qlink *link)
+{
+    qlink **new_array;
+    uint32_t result;
+
+    result = 0;
+    if (q->next_element == q->array_size)
+    {
+        new_array = (qlink **)realloc(q->array, sizeof(*q->array) * (q->array_size + q->grow_size));
+#ifdef RDPLIB_DEBUG
+        assert(new_array != NULL);
+#endif
+        if (new_array == NULL)
         {
-            return;
+            return 1;
         }
-
-        pqueue_swap(queue, index, smaller);
-        index = smaller;
+        q->array = new_array;
+        q->array_size += q->grow_size;
     }
+
+    q->array[q->next_element] = link;
+    link->index = q->next_element;
+    pqueue_siftup(q, q->next_element);
+    ++q->next_element;
+    return result;
 }
 
-void pqueue_resort_by_link(rdp_pqueue_t *queue, rdp_pqueue_link_t *link)
+void *pqueue_remove_by_link(pqueue_t *q, qlink *link)
 {
-    uint32_t original_index = link->heap_index;
-    pqueue_siftup(queue, original_index);
-
-    // If the changed link moved up, its displaced parent now occupies the original slot.
-    pqueue_siftdown(queue, original_index);
+    return pqueue_remove_index(q, link->index);
 }
 
-void *pqueue_remove_by_link(rdp_pqueue_t *queue, rdp_pqueue_link_t *link)
+void pqueue_resort_by_link(pqueue_t *q, qlink *link)
 {
-    uint32_t index = link->heap_index;
-    void *value = queue->items[index]->value;
+    pqueue_resort_index(q, link->index);
+}
 
-    --queue->count;
-    if (queue->count != index)
+void *pqueue_remove_head(pqueue_t *q)
+{
+    void *item;
+
+    item = NULL;
+    if (q->next_element)
     {
-        queue->items[index] = queue->items[queue->count];
-        queue->items[index]->heap_index = index;
-        pqueue_siftdown(queue, index);
-        pqueue_siftup(queue, index);
+        item = pqueue_remove_index(q, 0);
     }
-
-    return value;
+    return item;
 }
 
-void *pqueue_remove_head(rdp_pqueue_t *queue)
+void *pqueue_peek_head(pqueue_t *q)
 {
-    void *value;
+    void *item;
 
-    if (!queue->count)
+    item = NULL;
+    if (q->next_element)
     {
-        return NULL;
+        item = q->array[0]->item;
     }
-
-    value = queue->items[0]->value;
-    --queue->count;
-    if (queue->count)
-    {
-        queue->items[0] = queue->items[queue->count];
-        queue->items[0]->heap_index = 0;
-        pqueue_siftdown(queue, 0);
-    }
-
-    return value;
-}
-
-void *pqueue_peek_head(const rdp_pqueue_t *queue)
-{
-    return queue->count ? queue->items[0]->value : NULL;
+    return item;
 }

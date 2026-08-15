@@ -9,8 +9,10 @@
 #include "fast.h"
 #include "packet.h"
 #include "rdp.h"
+#include "rdplib_rdp.h"
 #include "rdplib_platform.h"
 #include "stats.h"
+#include "rdpstat.h"
 
 #ifdef _MSC_VER
 #include <crtdbg.h>
@@ -24,7 +26,12 @@ enum
     TEST_PROTOCOL_UDP = 17
 };
 
-static rdp_global_statistics_t test_statistics;
+static rdp_stat test_statistics;
+
+_Static_assert(_Generic(&rdplib_rdp_handle_reported_icmp,
+                        void (*)(rdp_t *, struct sockaddr *, uint8_t, uint8_t, uint8_t, uint8_t, struct sockaddr_in *): 1,
+                        default: 0),
+               "rdplib_rdp_handle_reported_icmp internal signature");
 
 static void store_native_u16(uint8_t *destination, uint16_t value)
 {
@@ -51,7 +58,7 @@ static intptr_t create_loopback_receiver(uint8_t address[16])
 
 int main(void)
 {
-    const uint8_t unknown_source[16] = {0};
+    struct sockaddr_in unknown_source;
     uint8_t first_address[16];
     uint8_t second_address[16];
     rdp_t *owner = NULL;
@@ -72,6 +79,7 @@ int main(void)
     memset(&test_statistics, 0, sizeof(test_statistics));
     g_rdp_stat = &test_statistics;
     fast_malloc_init(1024u * 1024u);
+    memset(&unknown_source, 0, sizeof(unknown_source));
 
     assert(rdp_create(&owner, 0, 2, RDP_CREATE_REQUIRE_IPV4) == 0);
     first_receiver = create_loopback_receiver(first_address);
@@ -84,13 +92,13 @@ int main(void)
     assert(connection_connected(first));
     assert(connection_connected(second));
 
-    rdp_handle_reported_icmp(owner, first->transmit.remote_address, 3, 3, 0, 0, unknown_source);
-    rdp_handle_reported_icmp(owner, first->transmit.remote_address, 3, 3, 0, 0, unknown_source);
+    rdplib_rdp_handle_reported_icmp(owner, &first->tx_remote_addr, 3, 3, 0, 0, &unknown_source);
+    rdplib_rdp_handle_reported_icmp(owner, &first->tx_remote_addr, 3, 3, 0, 0, &unknown_source);
 
     assert(!connection_connected(first));
-    assert(first->transmit.disconnect_reason == RDP_DISCONNECT_REASON_ICMP);
-    assert(first->receive.icmp_count == 1);
-    assert(test_statistics.disconnect_icmp_destination_unreachable_by_code[3] == 1);
+    assert(first->tx_disconnect_reason == RDP_DISCONNECT_REASON_ICMP);
+    assert(first->rx_icmp_received == 1);
+    assert(test_statistics.connections_dropped_unreachable[3] == 1);
     assert(connection_connected(second));
 
     arrival = rdp_receive(owner, 1000);

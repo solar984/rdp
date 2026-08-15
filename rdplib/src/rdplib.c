@@ -12,7 +12,7 @@
 struct rdplib_runtime_t
 {
     rdplib_platform_mutex_t lock;
-    rdp_global_statistics_t statistics;
+    rdp_stat statistics;
     uint32_t endpoint_count;
     uint32_t outstanding_messages;
 };
@@ -85,10 +85,10 @@ static void rdplib_connection_destroy_handle(rdplib_connection_t *connection)
 static void rdplib_connection_clear_packet_drop_callback(connection_t *raw)
 {
 #ifndef RDPLIB_SOURCE_FAITHFUL
-    rdplib_platform_mutex_lock(&raw->lock);
+    umutex_lock(&raw->cn_lock);
     raw->rdplib_packet_drop_callback = NULL;
     raw->rdplib_packet_drop_context = NULL;
-    rdplib_platform_mutex_unlock(&raw->lock);
+    umutex_unlock(&raw->cn_lock);
 #else
     (void)raw;
 #endif
@@ -182,7 +182,7 @@ static rdplib_connection_t *rdplib_create_connection_handle(rdplib_endpoint_t *e
     connection->endpoint = endpoint;
     connection->raw = borrowed;
     connection->application_owned = (uint8_t)(accept_pending == 0);
-    memcpy(connection->remote_address, borrowed->transmit.remote_address, sizeof(connection->remote_address));
+    memcpy(connection->remote_address, &borrowed->tx_remote_addr, sizeof(connection->remote_address));
     connection->all_next = endpoint->connections;
     endpoint->connections = connection;
 
@@ -220,11 +220,14 @@ static rdplib_message_t *rdplib_wrap_message(rdplib_endpoint_t *endpoint, msg_ar
     message->runtime = endpoint->runtime;
     // The caller owns the original fast allocation.  The payload is not copied.
     message->arrival = arrival;
-    message->payload_bytes = arrival->payload_bytes;
-    message->flags = arrival->flags;
-    message->stream_id = arrival->stream_id;
-    message->disconnect = (uint8_t)(arrival->sender_connection != NULL && arrival->payload_bytes == 0 && (arrival->flags & RDP_FLAG_FIN) == 0);
-    memcpy(message->sender_address, arrival->sender_address, sizeof(message->sender_address));
+    message->payload_bytes = arrival->size;
+    message->flags = arrival->options;
+    message->stream_id = arrival->stream;
+    message->disconnect = (uint8_t)(arrival->sender != NULL && arrival->size == 0 && (arrival->options & RDP_FLAG_FIN) == 0);
+    if (!arrival->sender)
+    {
+        memcpy(message->sender_address, &arrival->from, sizeof(message->sender_address));
+    }
 
     rdplib_runtime_add_outstanding(endpoint->runtime);
     return message;
@@ -266,13 +269,13 @@ static void rdplib_queue_connectionless(rdplib_endpoint_t *endpoint, rdplib_mess
 
 static int rdplib_process_arrival(rdplib_endpoint_t *endpoint, msg_arrival_t *arrival)
 {
-    connection_t *raw = (connection_t *)arrival->sender_connection;
+    connection_t *raw = arrival->sender;
     rdplib_connection_t *connection = NULL;
     rdplib_message_t *message;
 
     if (raw)
     {
-        int create_for_arrival = arrival->payload_bytes != 0 || (arrival->flags & RDP_FLAG_FIN) != 0;
+        int create_for_arrival = arrival->size != 0 || (arrival->options & RDP_FLAG_FIN) != 0;
 
         connection = rdplib_find_connection(endpoint, raw);
         if (!connection && create_for_arrival)
@@ -350,7 +353,11 @@ int rdplib_runtime_destroy(rdplib_runtime_t *runtime)
     }
 
     rdplib_active_runtime = NULL;
+#ifdef RDP_DEAD_CODE
+    g_rdp_stat = &rdp_stat_struct;
+#else
     g_rdp_stat = NULL;
+#endif
     fast_malloc_destroy();
     rdplib_platform_mutex_destroy(&runtime->lock);
     rdplib_platform_free(runtime);
@@ -458,7 +465,7 @@ int rdplib_endpoint_destroy(rdplib_endpoint_t *endpoint)
 
 uint16_t rdplib_endpoint_local_port(const rdplib_endpoint_t *endpoint)
 {
-    return endpoint && endpoint->raw ? (uint16_t)(((uint16_t)endpoint->raw->ipv4_address[2] << 8) | endpoint->raw->ipv4_address[3]) : 0;
+    return endpoint && endpoint->raw ? ntohs(endpoint->raw->local_udp_addr.sin_port) : 0;
 }
 
 int rdplib_endpoint_process(rdplib_endpoint_t *endpoint, int32_t timeout_ms)
@@ -545,7 +552,7 @@ int rdplib_connect(rdplib_endpoint_t *endpoint, rdplib_connection_t **output, co
     }
     *output = NULL;
 
-    result = rdp_connect(endpoint->raw, &raw, host, port, 0);
+    result = rdp_connect(endpoint->raw, &raw, (char *)host, port, 0);
     if (result != 0)
     {
         return result;
@@ -574,9 +581,9 @@ int rdplib_connection_is_usable(rdplib_connection_t *connection)
     usable = raw && !connection->close_started && !connection->peer_fin && !connection->disconnected;
     if (usable)
     {
-        rdplib_platform_mutex_lock(&raw->lock);
-        usable = raw->transmit.connected && !raw->transmit.transmit_stopped && !raw->transmit.fin_sent;
-        rdplib_platform_mutex_unlock(&raw->lock);
+        umutex_lock(&raw->cn_lock);
+        usable = raw->tx_connected && !raw->tx_stopped && !raw->tx_fin_sent;
+        umutex_unlock(&raw->cn_lock);
     }
     return usable;
 }
@@ -597,8 +604,8 @@ static int rdplib_connection_enable_keepalive_internal(rdplib_connection_t *conn
         return RDPLIB_ERROR_NOT_USABLE;
     }
 
-    rdplib_platform_mutex_lock(&raw->lock);
-    if (!raw->transmit.connected || raw->transmit.fin_sent || raw->transmit.transmit_stopped)
+    umutex_lock(&raw->cn_lock);
+    if (!raw->tx_connected || raw->tx_fin_sent || raw->tx_stopped)
     {
         result = RDPLIB_ERROR_NOT_USABLE;
     }
@@ -615,9 +622,9 @@ static int rdplib_connection_enable_keepalive_internal(rdplib_connection_t *conn
         (void)replace_interval;
         assert(!replace_interval);
 #endif
-        if ((raw->options & RDP_CONNECTION_FEATURE_KEEPALIVE) == 0)
+        if ((raw->cn_flags & RDP_CONNECTION_FEATURE_KEEPALIVE) == 0)
         {
-            raw->options |= RDP_CONNECTION_FEATURE_KEEPALIVE;
+            raw->cn_flags |= RDP_CONNECTION_FEATURE_KEEPALIVE;
             resort = 1;
         }
         if (resort)
@@ -625,7 +632,7 @@ static int rdplib_connection_enable_keepalive_internal(rdplib_connection_t *conn
             rdp_resort(raw, 1);
         }
     }
-    rdplib_platform_mutex_unlock(&raw->lock);
+    umutex_unlock(&raw->cn_lock);
     return result;
 }
 
@@ -669,8 +676,8 @@ int rdplib_connection_set_packet_drop_callback(rdplib_connection_t *connection, 
         return RDPLIB_ERROR_NOT_USABLE;
     }
 
-    rdplib_platform_mutex_lock(&raw->lock);
-    if (callback && (!raw->transmit.connected || raw->transmit.fin_sent || raw->transmit.transmit_stopped))
+    umutex_lock(&raw->cn_lock);
+    if (callback && (!raw->tx_connected || raw->tx_fin_sent || raw->tx_stopped))
     {
         result = RDPLIB_ERROR_NOT_USABLE;
     }
@@ -679,7 +686,7 @@ int rdplib_connection_set_packet_drop_callback(rdplib_connection_t *connection, 
         raw->rdplib_packet_drop_callback = callback;
         raw->rdplib_packet_drop_context = callback ? context : NULL;
     }
-    rdplib_platform_mutex_unlock(&raw->lock);
+    umutex_unlock(&raw->cn_lock);
     return result;
 #endif
 }
@@ -766,8 +773,8 @@ int rdplib_connection_set_data_rate(rdplib_connection_t *connection, uint32_t by
         return RDPLIB_ERROR_NOT_USABLE;
     }
 
-    rdplib_platform_mutex_lock(&raw->lock);
-    if (!raw->transmit.connected || raw->transmit.fin_sent || raw->transmit.transmit_stopped)
+    umutex_lock(&raw->cn_lock);
+    if (!raw->tx_connected || raw->tx_fin_sent || raw->tx_stopped)
     {
         result = RDPLIB_ERROR_NOT_USABLE;
     }
@@ -775,7 +782,7 @@ int rdplib_connection_set_data_rate(rdplib_connection_t *connection, uint32_t by
     {
         (void)connection_set_max_data_rate(raw, bytes_per_second);
     }
-    rdplib_platform_mutex_unlock(&raw->lock);
+    umutex_unlock(&raw->cn_lock);
     return result;
 }
 
@@ -794,8 +801,8 @@ int rdplib_connection_set_send_buffer_size(rdplib_connection_t *connection, uint
         return RDPLIB_ERROR_NOT_USABLE;
     }
 
-    rdplib_platform_mutex_lock(&raw->lock);
-    if (!raw->transmit.connected || raw->transmit.fin_sent || raw->transmit.transmit_stopped)
+    umutex_lock(&raw->cn_lock);
+    if (!raw->tx_connected || raw->tx_fin_sent || raw->tx_stopped)
     {
         result = RDPLIB_ERROR_NOT_USABLE;
     }
@@ -803,7 +810,7 @@ int rdplib_connection_set_send_buffer_size(rdplib_connection_t *connection, uint
     {
         connection_set_send_buffer_size(raw, bytes);
     }
-    rdplib_platform_mutex_unlock(&raw->lock);
+    umutex_unlock(&raw->cn_lock);
     return result;
 }
 
@@ -832,7 +839,7 @@ int rdplib_connection_get_remote_ipv4(rdplib_connection_t *connection, uint8_t a
 
 int rdplib_connection_get_perf_stats(rdplib_connection_t *connection, rdplib_connection_perf_stats_t *statistics)
 {
-    rdp_connection_perf_stats_t raw_statistics;
+    perf_stats_t raw_statistics;
 
     if (!connection || !statistics)
     {
@@ -843,20 +850,20 @@ int rdplib_connection_get_perf_stats(rdplib_connection_t *connection, rdplib_con
         return RDPLIB_ERROR_NOT_USABLE;
     }
     connection_get_perf_stats(connection->raw, &raw_statistics);
-    statistics->last_packet_receive_time_ms = raw_statistics.last_packet_receive_time_ms;
-    statistics->received_packet_sequence_history = raw_statistics.received_packet_sequence_history;
-    statistics->last_received_packet_sequence = raw_statistics.last_received_packet_sequence;
-    statistics->rtt_mean_ms = raw_statistics.rtt_mean_ms;
-    statistics->rtt_deviation_ms = raw_statistics.rtt_deviation_ms;
-    statistics->last_ping_sample_ms = raw_statistics.last_ping_sample_ms;
-    statistics->queued_reliable_bytes = raw_statistics.queued_reliable_bytes;
-    statistics->transmit_stall_time_ms = raw_statistics.transmit_stall_time_ms;
+    statistics->last_packet_receive_time_ms = raw_statistics.time_last_arrival;
+    statistics->received_packet_sequence_history = raw_statistics.recent_seqnum_history;
+    statistics->last_received_packet_sequence = raw_statistics.highest_seqnum_received;
+    statistics->rtt_mean_ms = raw_statistics.average_rt_time;
+    statistics->rtt_deviation_ms = raw_statistics.std_deviation;
+    statistics->last_ping_sample_ms = raw_statistics.last_rt_time;
+    statistics->queued_reliable_bytes = raw_statistics.queue_size;
+    statistics->transmit_stall_time_ms = raw_statistics.stall_time;
     return RDPLIB_OK;
 }
 
 int rdplib_connection_get_disconnect_info(rdplib_connection_t *connection, rdplib_disconnect_info_t *information)
 {
-    rdp_connection_disconnect_info_t raw_information;
+    disconnect_info_t raw_information;
 
     if (!connection || !information)
     {
@@ -866,15 +873,15 @@ int rdplib_connection_get_disconnect_info(rdplib_connection_t *connection, rdpli
     {
         return RDPLIB_ERROR_NOT_USABLE;
     }
-    rdplib_platform_mutex_lock(&connection->raw->lock);
+    umutex_lock(&connection->raw->cn_lock);
     connection_get_disconnect_info(connection->raw, &raw_information, sizeof(raw_information));
-    rdplib_platform_mutex_unlock(&connection->raw->lock);
-    information->reason = raw_information.reason;
-    if (raw_information.reason == RDP_DISCONNECT_REASON_ICMP)
+    umutex_unlock(&connection->raw->cn_lock);
+    information->reason = raw_information.disconnect_reason;
+    if (raw_information.disconnect_reason == RDP_DISCONNECT_REASON_ICMP)
     {
         information->icmp_type = raw_information.icmp_type;
         information->icmp_code = raw_information.icmp_code;
-        memcpy(information->icmp_source_ipv4, &raw_information.icmp_source_ipv4, sizeof(information->icmp_source_ipv4));
+        memcpy(information->icmp_source_ipv4, &raw_information.icmp_from, sizeof(information->icmp_source_ipv4));
     }
     else
     {

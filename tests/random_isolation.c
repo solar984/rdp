@@ -32,11 +32,11 @@ int main(void)
     memset(&owner, 0, sizeof(owner));
     memset(&connection, 0, sizeof(connection));
     memcpy(remote_address, &address_family, sizeof(address_family));
-    owner.ipv4_socket = -1;
-    owner.icmp_probe_socket = -1;
-    tx_init(&connection, &owner, remote_address);
+    owner.udp_socket = -1;
+    owner.trace_socket = -1;
+    tx_init(&connection, &owner, (struct sockaddr *)(void *)remote_address);
     observed_second = rand();
 
-    printf("first_preserved=%d second_preserved=%d initial_message_id=%u\n", observed_first == expected_first, observed_second == expected_second, connection.transmit.initial_outgoing_message_id);
+    printf("first_preserved=%d second_preserved=%d initial_message_id=%u\n", observed_first == expected_first, observed_second == expected_second, connection.tx_syn_msgid);
     return observed_first == expected_first && observed_second == expected_second ? 0 : 1;
 }

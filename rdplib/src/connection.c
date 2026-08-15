@@ -3,661 +3,844 @@
 
 #include "connection.h"
 
-#include "rdp.h"
-#include "rdplib_constants.h"
-#include "trace.h"
-#include "rdplib_wire.h"
-
+#ifdef RDPLIB_DEBUG
+#include <assert.h>
+#endif
+#include <stddef.h>
 #include <string.h>
 
-void connection_init(connection_t *connection, rdp_t *owner, const uint8_t remote_address[16], uint32_t options)
-{
-    connection->owner = owner;
-    tx_init(connection, owner, remote_address);
-    rx_init(connection);
-
-    connection->linger_active = 0;
-    connection->linger_deadline_ms = 0;
-    connection->locally_initiated = 0;
-    connection->reserved_receive_gate = 0;
-    memset(connection->application_storage, 0, sizeof(connection->application_storage));
-    rdplib_platform_mutex_init(&connection->lock);
-
-    connection->connection_hash_link.value = connection;
-    connection->connection_hash_link.key = connection->transmit.remote_address;
-    connection->event_link.value = connection;
-    connection->event_link.key = &connection->event_timeout;
-    connection->reference_count = 1;
-    connection->event_timeout.infinite = 1;
-    connection->event_timeout.deadline_ms = 0;
-    connection->event_type = 0;
-    connection->options = options;
+#ifdef RDPLIB_DEBUG
+#include "dpf.h"
+#endif
+#ifdef RDPLIB_SOURCE_FAITHFUL
+#include "log.h"
+#endif
+#include "rdp.h"
 #ifndef RDPLIB_SOURCE_FAITHFUL
-    connection->rdplib_keepalive_interval_ms = RDPLIB_DEFAULT_KEEPALIVE_INTERVAL_MS;
-    connection->rdplib_packet_drop_callback = NULL;
-    connection->rdplib_packet_drop_context = NULL;
+#include "protocol_limits.h"
+#include "rdplib_wire.h"
+#endif
+#include "rdpstat.h"
+#include "rx.h"
+#include "rxq.h"
+#include "trace.h"
+#include "tx.h"
+#include "usemaphore.h"
+#include "utime.h"
+
+void connection_init(connection_t *c, rdp_t *rdp, struct sockaddr *remote_addr, uint32_t flags)
+{
+    c->cn_rdp = rdp;
+    tx_init(c, rdp, remote_addr);
+    rx_init(c);
+
+    c->cn_closed = 0;
+    c->cn_delete_time = 0;
+    c->cn_accepted = 0;
+    c->cn_abort = 0;
+    c->cn_app_ptr[0] = NULL;
+    c->cn_app_ptr[1] = NULL;
+    c->cn_app_ptr[2] = NULL;
+
+    umutex_create(&c->cn_lock);
+    c->cn_addr_map_link.item = c;
+    c->cn_addr_map_link.key.p = &c->tx_remote_addr;
+    c->cn_event_queue_link.item = c;
+    c->cn_event_queue_link.key.p = &c->cn_event_time;
+    c->cn_event_time.infinite = 1;
+    c->cn_event_time.time = 0;
+    c->cn_event_type = CONNECTION_EVENT_NONE;
+    c->cn_flags = flags;
+
+#ifndef RDPLIB_SOURCE_FAITHFUL
+    c->rdplib_keepalive_interval_ms = RDPLIB_DEFAULT_KEEPALIVE_INTERVAL_MS;
+    c->rdplib_packet_drop_callback = NULL;
+    c->rdplib_packet_drop_context = NULL;
 #endif
 }
 
-int connection_create(connection_t *connection)
+uint32_t connection_create(connection_t *c)
 {
-    int result = tx_create(connection);
+    uint32_t result;
 
+    result = tx_create(c);
     if (result == 0)
     {
-        result = rx_create(connection);
+        return rx_create(c);
     }
     return result;
 }
 
-void connection_destroy(connection_t *connection)
+void connection_destroy(connection_t *c)
 {
-    tx_destroy(connection);
-    rx_destroy(connection);
-    rdplib_platform_mutex_destroy(&connection->lock);
+    tx_destroy(c);
+    rx_destroy(c);
+    umutex_destroy(&c->cn_lock);
 }
 
-int connection_connected(const connection_t *connection)
+void connection_recalc_event_timeout(connection_t *c, timeout_data *uevent_time)
 {
-    return connection->transmit.connected;
-}
+    uevent_time->infinite = 1;
+    uevent_time->time = 0;
+#ifdef RDPLIB_DEBUG
+    assert(umutex_owner( &c->cn_lock ));
+#endif
+    c->cn_event_type = CONNECTION_EVENT_NONE;
 
-void *connection_app_ptr(connection_t *connection)
-{
-    return connection;
-}
-
-uint8_t *connection_get_remote_addr(connection_t *connection)
-{
-    return connection->transmit.remote_address;
-}
-
-void connection_get_disconnect_info(const connection_t *connection, void *output, uint32_t output_bytes)
-{
-    rdp_connection_disconnect_info_t *information;
-
-    if (output_bytes != sizeof(rdp_connection_disconnect_info_t))
+    if (!c->tx_connected || c->tx_stopped)
     {
-        return;
+        if (c->tx_connected && c->tx_stopped && c->tx_delayed_ack)
+        {
+            c->cn_event_type = CONNECTION_EVENT_TX;
+            uevent_time->infinite = 0;
+            uevent_time->time = c->tx_ack_time;
+        }
+    }
+    else
+    {
+        tx_get_event_time(c, uevent_time);
+        if (!uevent_time->infinite)
+        {
+            c->cn_event_type = CONNECTION_EVENT_TX;
+        }
     }
 
-    information = (rdp_connection_disconnect_info_t *)output;
-    information->reason = connection->transmit.disconnect_reason;
-    information->icmp_code = connection->receive.last_icmp_code;
-    information->icmp_type = connection->receive.last_icmp_type;
-    information->icmp_source_ipv4 = connection->receive.last_icmp_source;
-}
-
-void connection_get_perf_stats(connection_t *connection, rdp_connection_perf_stats_t *statistics)
-{
-    rdp_transmit_initialization_state_t *transmit;
-
-    // The returned pointer is intentionally ignored. Endpoint uniqueness is
-    // an unchecked invariant in the original connection owner.
-    (void)connhash_lock(&connection->owner->connections, connection->transmit.remote_address);
-
-    transmit = &connection->transmit;
-    statistics->last_packet_receive_time_ms = connection->receive.last_packet_receive_time_ms;
-    statistics->received_packet_sequence_history = connection->receive.recording.packet_sequence.received_packet_sequence_history;
-    statistics->last_received_packet_sequence = connection->receive.recording.packet_sequence.last_received_packet_sequence;
-    statistics->rtt_mean_ms = transmit->rtt_estimator.mean_ms;
-    statistics->rtt_deviation_ms = transmit->rtt_estimator.deviation_ms;
-    statistics->last_ping_sample_ms = transmit->last_ping_sample_ms;
-    statistics->queued_reliable_bytes = transmit->sent_messages.queued_bytes + transmit->ready_messages.queued_bytes + transmit->window_blocked_messages.queued_bytes;
-    statistics->transmit_stall_time_ms = tx_get_stall_time(connection);
-
-    rdp_unlock(connection);
-
-    // This order is source faithful and intentionally exposes the original
-    // lifetime hazard described above.
-    if (connection->transmit.address_family == RDP_TRANSMIT_ADDRESS_SERIAL)
+    if (c->cn_flags & RDP_CONNECTION_FEATURE_KEEPALIVE)
     {
-        statistics->transmit_stall_time_ms = rdp_get_serial_stall_time(connection->owner);
+        if (c->tx_syn_sent && !c->tx_fin_sent && c->tx_connected && !c->tx_stopped
+#ifndef RDPLIB_SOURCE_FAITHFUL
+            // prevents a keepalive from consuming the final available history slot
+            && (uint16_t)(c->tx_next_msgid - c->tx_acked_thru - 1u) < RDP_BITARRAY_BITS - 1u
+#endif
+        )
+        {
+            uint32_t alive_time;
+            int32_t delta;
+
+#ifdef RDPLIB_SOURCE_FAITHFUL
+            alive_time = c->tx_time_last_guaranteed_send + 10000u;
+#else
+            alive_time = c->tx_time_last_guaranteed_send + c->rdplib_keepalive_interval_ms;
+#endif
+            delta = (int32_t)(alive_time - uevent_time->time);
+            if (uevent_time->infinite || delta < 0)
+            {
+#ifdef RDPLIB_DEBUG
+                dpf(0x40u, "CONNECTION_EVENT_ALIVE: overriding other events with alive event (%d) { %u, %u }\n", delta, uevent_time->infinite, uevent_time->time);
+#endif
+                c->cn_event_type = CONNECTION_EVENT_ALIVE;
+                uevent_time->infinite = 0;
+                uevent_time->time = alive_time;
+            }
+        }
+    }
+
+    if ((c->cn_flags & RDP_CONNECTION_FEATURE_TRACEROUTE) && c->trace_pass < 3)
+    {
+        int32_t delta;
+        uint32_t trace_time_next_send;
+
+#ifdef RDPLIB_DEBUG
+        assert(c->trace_next_ttl <= c->trace_max_ttl);
+#endif
+        if (c->trace_en_route)
+        {
+            trace_time_next_send = c->trace_time + timeout_get_timeout(&c->tx_rt_tracker);
+        }
+        else
+        {
+            trace_time_next_send = c->trace_time;
+        }
+
+        delta = (int32_t)(trace_time_next_send - uevent_time->time);
+        if (uevent_time->infinite || delta < 0)
+        {
+#ifdef RDPLIB_DEBUG
+            dpf(0x40u, "CONNECTION_EVENT_TRACE: overriding other events with trace event (%d) { %u, %u }\n", delta, uevent_time->infinite, uevent_time->time);
+#endif
+            c->cn_event_type = CONNECTION_EVENT_TRACE;
+            uevent_time->infinite = 0;
+            uevent_time->time = trace_time_next_send;
+        }
+    }
+
+    if (c->cn_closed)
+    {
+        int32_t delta;
+
+        delta = (int32_t)(c->cn_delete_time - uevent_time->time);
+        if (uevent_time->infinite || delta < 0)
+        {
+#ifdef RDPLIB_DEBUG
+            dpf(0x40u, "CONNECTION_EVENT_DELETE: overriding other events with delete event (%d) { %u, %u }\n", delta, uevent_time->infinite, uevent_time->time);
+#endif
+            c->cn_event_type = CONNECTION_EVENT_DELETE;
+            uevent_time->infinite = 0;
+            uevent_time->time = c->cn_delete_time;
+        }
     }
 }
 
-int connection_linger_expired(const connection_t *connection)
+#ifndef RDPLIB_SOURCE_FAITHFUL
+static uint32_t rdplib_connection_abort_short_datagram(connection_t *c)
 {
-    return connection->linger_active && (int32_t)(connection->linger_deadline_ms - time_get_ms()) <= 10;
+    ++g_rdp_stat->discarded_too_short;
+    ++c->stat.discarded_too_short;
+    if (c->tx_connected)
+    {
+        tx_abort_connection(c, RDP_DISCONNECT_REASON_PROTOCOL_ERROR);
+    }
+    return RDP_RX_ABORT;
 }
 
-void connection_set_send_buffer_size(connection_t *connection, uint32_t bytes)
+static uint32_t rdplib_connection_abort_invalid_fragment(connection_t *c)
 {
-    connection->transmit.send_buffer_limit = bytes;
+    ++g_rdp_stat->discarded_bad_fragment;
+    ++c->stat.discarded_bad_fragment;
+    if (c->tx_connected)
+    {
+        tx_abort_connection(c, RDP_DISCONNECT_REASON_PROTOCOL_ERROR);
+    }
+    return RDP_RX_ABORT;
 }
 
-int connection_close(connection_t *connection, uint32_t timeout_ms, int *result, rdplib_platform_event_t *completion_event)
+static uint32_t rdplib_connection_preflight_arrival(connection_t *c, const uint8_t *packet, uint16_t size, rdp_header_t *header)
 {
-    rdp_application_receive_t *application;
-    rdp_transmit_initialization_state_t *transmit;
-    int completion_pending = 1;
-    int producer_was_nonempty;
-    int producer_is_empty;
+    uint32_t required_size;
+    uint32_t fragment_offset = 0;
+    uint16_t options;
+    uint16_t ack_options;
 
-    if (!connection)
+    if (!c || !packet || !header)
+    {
+        return RDP_RX_ABORT;
+    }
+    if (size < sizeof(uint16_t))
+    {
+        return rdplib_connection_abort_short_datagram(c);
+    }
+
+    options = rdplib_load_network_u16(packet);
+    if ((((options & (RDP_FLAG_SYN | RDP_FLAG_FIN | RDP_FLAG_FRAGMENT)) == 0) || (options & RDP_FLAG_MSGID) != 0) && (options & RDP_FLAG_MULTI) == 0)
+    {
+        required_size = 4;
+        ack_options = options & (RDP_FLAG_ACKTHRU | RDP_FLAG_MASKOFFSET);
+        if (ack_options == RDP_FLAG_ACKTHRU || ack_options == RDP_FLAG_MASKOFFSET)
+        {
+            required_size += 2u + ((options & RDP_FLAG_ACK_MASK_LENGTH) >> 4);
+        }
+        if (options & RDP_FLAG_MSGID)
+        {
+            required_size += 2;
+        }
+        if (options & RDP_FLAG_FRAGMENT)
+        {
+            fragment_offset = required_size;
+            required_size += 6;
+        }
+        if (options & RDP_FLAG_SEQUENCED)
+        {
+            ++required_size;
+            if (options & RDP_FLAG_MSGID)
+            {
+                ++required_size;
+            }
+        }
+
+        if (required_size > size)
+        {
+            return rdplib_connection_abort_short_datagram(c);
+        }
+        if (fragment_offset)
+        {
+            uint32_t data_size = size - required_size;
+
+            if (rdplib_load_network_u16(packet + fragment_offset + 4u) > RDP_FRAGMENT_COUNT_MAX || data_size < 1u ||
+                data_size > RDP_FRAGMENT_PAYLOAD_BYTES)
+            {
+                return rdplib_connection_abort_invalid_fragment(c);
+            }
+        }
+    }
+    return RDP_RX_ACCEPT;
+}
+#endif
+
+uint32_t connection_parse_and_validate_arrival(connection_t *c, uint16_t *packet, uint16_t size, rdp_header_t *header)
+{
+    uint16_t *src;
+    uint32_t acksize;
+    uint32_t validation;
+
+#ifndef RDPLIB_SOURCE_FAITHFUL
+    validation = rdplib_connection_preflight_arrival(c, (const uint8_t *)packet, size, header);
+    if (validation != RDP_RX_ACCEPT)
+    {
+        return validation;
+    }
+#endif
+
+    validation = RDP_RX_ACCEPT;
+#ifdef RDPLIB_DEBUG
+    assert(umutex_owner( &c->cn_lock ));
+#endif
+    src = packet;
+#ifdef RDPLIB_SOURCE_FAITHFUL
+    header->options = ntohs(*src++);
+#else
+    header->options = rdplib_load_network_u16((const uint8_t *)src);
+    ++src;
+#endif
+    if (((header->options & (RDP_FLAG_SYN | RDP_FLAG_FIN)) && !(header->options & RDP_FLAG_MSGID)) ||
+        ((header->options & RDP_FLAG_FRAGMENT) && !(header->options & RDP_FLAG_MSGID)) || (header->options & RDP_FLAG_MULTI))
+    {
+#ifdef RDPLIB_SOURCE_FAITHFUL
+        char addr[64];
+#endif
+
+        validation = RDP_RX_ABORT;
+#ifdef RDPLIB_SOURCE_FAITHFUL
+        format_sockaddr(addr, &c->tx_remote_addr);
+#endif
+        ++g_rdp_stat->discarded_bad_options;
+        ++c->stat.discarded_bad_options;
+    }
+    else
+    {
+#ifdef RDPLIB_SOURCE_FAITHFUL
+        header->seqnum = ntohs(*src++);
+#else
+        header->seqnum = rdplib_load_network_u16((const uint8_t *)src);
+        ++src;
+#endif
+        validation = rx_validate_seqnum_arrival(c, header->seqnum);
+        if (validation == RDP_RX_ACCEPT)
+        {
+            header->ack = src;
+            validation = tx_validate_ack_arrival(c, header, &acksize);
+            if (validation == RDP_RX_ACCEPT)
+            {
+                src = (uint16_t *)((uint8_t *)src + acksize);
+                if (header->options & RDP_FLAG_MSGID)
+                {
+                    memcpy(&header->msgid, src++, sizeof(header->msgid));
+                    header->msgid = ntohs(header->msgid);
+                    validation = rx_validate_msgid_arrival(c, header);
+                }
+
+                if (validation == RDP_RX_ACCEPT)
+                {
+                    header->fragid = 0;
+                    header->frag_number = 0;
+                    header->frag_total = 1;
+                    if (header->options & RDP_FLAG_FRAGMENT)
+                    {
+                        memcpy(&header->fragid, src++, sizeof(header->fragid));
+                        header->fragid = ntohs(header->fragid);
+                        memcpy(&header->frag_number, src++, sizeof(header->frag_number));
+                        header->frag_number = ntohs(header->frag_number);
+                        memcpy(&header->frag_total, src++, sizeof(header->frag_total));
+                        header->frag_total = ntohs(header->frag_total);
+                    }
+
+                    if (header->options & RDP_FLAG_SEQUENCED)
+                    {
+                        uint8_t *small_src;
+
+                        small_src = (uint8_t *)src;
+                        header->stream = *small_src++;
+                        if (header->options & RDP_FLAG_MSGID)
+                        {
+                            header->stream_seqnum = *small_src++;
+                        }
+                        src = (uint16_t *)small_src;
+                        validation = rx_validate_stream_arrival(c, header);
+                    }
+
+                    if (validation == RDP_RX_ACCEPT)
+                    {
+                        header->header_size = (uint16_t)((uint8_t *)src - (uint8_t *)packet);
+                        if (size >= header->header_size)
+                        {
+                            header->data_size = size - header->header_size;
+                            if (header->options & RDP_FLAG_FRAGMENT)
+                            {
+                                validation = rx_validate_fragment_arrival(c, header);
+                            }
+                        }
+                        else
+                        {
+#ifdef RDPLIB_SOURCE_FAITHFUL
+                            char addr[64];
+#endif
+
+                            validation = RDP_RX_ABORT;
+#ifdef RDPLIB_SOURCE_FAITHFUL
+                            format_sockaddr(addr, &c->tx_remote_addr);
+                            discard_log_append("%s received short packet %u < %u\n", addr, size, header->header_size);
+#endif
+                            ++g_rdp_stat->discarded_too_short;
+                            ++c->stat.discarded_too_short;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (validation == RDP_RX_ABORT && c->tx_connected)
+    {
+        tx_abort_connection(c, RDP_DISCONNECT_REASON_PROTOCOL_ERROR);
+    }
+    return validation;
+}
+
+void connection_record_arrival(connection_t *c, rdp_header_t *header, uint32_t *duplicate)
+{
+    *duplicate = 0;
+#ifdef RDPLIB_DEBUG
+    assert(umutex_owner( &c->cn_lock ));
+#endif
+    rx_record_packet_arrival(c);
+
+    if ((header->options & RDP_FLAG_RESET) && c->tx_connected)
+    {
+#ifdef RDPLIB_DEBUG
+        dpf(0x4000u, "[0x%08x] received reset bit\n", (uint32_t)(uintptr_t)c);
+#endif
+        tx_abort_connection(c, RDP_DISCONNECT_REASON_PEER_RESET);
+    }
+    else
+    {
+        if ((header->options & RDP_FLAG_STOP) && !c->tx_stopped)
+        {
+#ifdef RDPLIB_DEBUG
+            dpf(0x4000u, "[0x%08x] received stop bit\n", (uint32_t)(uintptr_t)c);
+#endif
+            tx_received_stopped(c);
+        }
+
+        rx_record_seqnum_arrival(c, header);
+        tx_record_ack_arrival(c, header);
+        if (header->options & RDP_FLAG_MSGID)
+        {
+            *duplicate = rx_record_msgid_arrival(c, header->msgid);
+            if (*duplicate)
+            {
+#ifdef RDPLIB_DEBUG
+                dpf(0x10u, "duplicate data received (%u)\n", header->msgid);
+#endif
+                ++g_rdp_stat->duplicate_packets_rx;
+                g_rdp_stat->duplicate_bytes_rx += header->data_size;
+                ++c->stat.duplicate_packets_rx;
+                c->stat.duplicate_bytes_rx += header->data_size;
+            }
+            else
+            {
+                ++g_rdp_stat->guaranteed_packets_rx;
+                g_rdp_stat->guaranteed_bytes_rx += header->data_size;
+                ++c->stat.guaranteed_packets_rx;
+                c->stat.guaranteed_bytes_rx += header->data_size;
+            }
+        }
+        else if (header->data_size)
+        {
+            ++g_rdp_stat->best_effort_packets_rx;
+            g_rdp_stat->best_effort_bytes_rx += header->data_size;
+            ++c->stat.best_effort_packets_rx;
+            c->stat.best_effort_bytes_rx += header->data_size;
+        }
+
+        g_rdp_stat->header_bytes_rx += header->header_size;
+        c->stat.header_bytes_rx += header->header_size;
+        if (header->options & RDP_FLAG_MSGID)
+        {
+            if (header->options & RDP_FLAG_FIN)
+            {
+#ifdef RDPLIB_DEBUG
+                dpf(0x4000u, "setting delayed ack for fin\n");
+#endif
+            }
+            tx_set_delayed_ack(c);
+        }
+    }
+}
+
+void connection_handle_icmp(connection_t *c, uint8_t type, uint8_t code, uint8_t trace_reply, uint8_t probe_index, struct sockaddr_in *from)
+{
+    uint32_t current_time;
+    uint32_t ignored;
+
+    ignored = 0;
+    current_time = time_get_ms();
+    if (trace_reply)
+    {
+        if (probe_index < c->trace_next_index && c->trace_probes)
+        {
+            trace_probe_t *tp;
+
+            tp = &c->trace_probes[probe_index];
+            if (type == 3 && code == 3 && c->trace_max_ttl > tp->ttl)
+            {
+                c->trace_max_ttl = tp->ttl;
+                if (c->trace_next_ttl > c->trace_max_ttl)
+                {
+                    ++c->trace_pass;
+                    c->trace_next_ttl = 1;
+                }
+#ifdef RDPLIB_DEBUG
+                dpf(0x10000000u, "TRACE: setting max ttl: %u\n", c->trace_max_ttl);
+#endif
+            }
+
+            tp->reply_time = current_time - tp->time_sent;
+#ifdef RDPLIB_SOURCE_FAITHFUL
+            tp->icmp_from = from->sin_addr;
+#else
+            memcpy(&tp->icmp_from, (const uint8_t *)from + offsetof(struct sockaddr_in, sin_addr), sizeof(tp->icmp_from));
+#endif
+            tp->icmp_type = type;
+            tp->icmp_code = code;
+            c->trace_en_route = 0;
+            c->trace_time = current_time;
+        }
+    }
+    else
+    {
+        switch (type)
+        {
+        case 3:
+            if (code < 16)
+            {
+                ++g_rdp_stat->icmp_unreachable[code];
+                ++c->stat.icmp_unreachable[code];
+            }
+            else
+            {
+                ++g_rdp_stat->icmp_unknown;
+                ++c->stat.icmp_unknown;
+            }
+            break;
+
+        case 4:
+            ++g_rdp_stat->icmp_source_quench;
+            ++c->stat.icmp_source_quench;
+            break;
+
+        case 11:
+            if (code < 2)
+            {
+                ++g_rdp_stat->icmp_ttl_expired[code];
+                ++c->stat.icmp_ttl_expired[code];
+            }
+            else
+            {
+                ++g_rdp_stat->icmp_unknown;
+                ++c->stat.icmp_unknown;
+            }
+            break;
+
+        case 12:
+            if (code < 2)
+            {
+                ++g_rdp_stat->icmp_parameter_problem[code];
+                ++c->stat.icmp_parameter_problem[code];
+            }
+            else
+            {
+                ++g_rdp_stat->icmp_unknown;
+                ++c->stat.icmp_unknown;
+            }
+            break;
+
+        default:
+            ignored = 1;
+            break;
+        }
+
+        if (!ignored)
+        {
+            ++c->rx_icmp_received;
+            c->rx_icmp_type = type;
+            c->rx_icmp_code = code;
+            c->rx_icmp_time = time_get_ms();
+#ifdef RDPLIB_SOURCE_FAITHFUL
+            c->rx_icmp_from.s_addr = from->sin_addr.s_addr;
+#else
+            memcpy(&c->rx_icmp_from.s_addr, (const uint8_t *)from + 4, sizeof(c->rx_icmp_from.s_addr));
+#endif
+            if (type == 3 && code == 3)
+            {
+                tx_abort_connection(c, RDP_DISCONNECT_REASON_ICMP);
+            }
+        }
+    }
+}
+
+void connection_event_process(connection_t *c, uint32_t max_time, timeout_data *next_time)
+{
+#ifdef RDPLIB_DEBUG
+    assert(umutex_owner( &c->cn_lock ));
+#endif
+    for (;;)
+    {
+        switch (c->cn_event_type)
+        {
+        case CONNECTION_EVENT_DELETE:
+#ifdef RDPLIB_DEBUG
+            dpf(0x2000u, "[0x%08x] processing CONNECTION_EVENT_DELETE\n", (uint32_t)(uintptr_t)c);
+#endif
+            return;
+
+        case CONNECTION_EVENT_TX:
+            tx_tx(c);
+            break;
+
+        case CONNECTION_EVENT_ALIVE:
+            tx_send_alive(c);
+            break;
+
+        case CONNECTION_EVENT_TRACE:
+            trace_send(c);
+            break;
+
+        default:
+#ifdef RDPLIB_DEBUG
+            assert(NULL != "Unknown connection event\n");
+#endif
+            break;
+        }
+
+        connection_recalc_event_timeout(c, next_time);
+        if (next_time->infinite || (int32_t)(max_time - next_time->time) < 0)
+        {
+            return;
+        }
+    }
+}
+
+uint32_t connection_close(connection_t *c, uint32_t linger_time, uint32_t *all_acked, uevent_t *all_acked_event)
+{
+    rdp_t *rdp;
+    uint32_t wait_to_signal;
+    uint32_t messages_in_queue;
+
+    if (!c)
     {
         return RDP_CONNECTION_SEND_INVALID_ARGUMENT;
     }
 
-    // Endpoint uniqueness is an unchecked source invariant.
-    (void)connhash_lock(&connection->owner->connections, connection->transmit.remote_address);
-    application = &connection->owner->application_receive;
-    rdplib_platform_mutex_lock(&application->producer_lock);
-    producer_was_nonempty = application->producer_queue.messages.head && application->producer_queue.messages.head->value;
-    rxq_flush_all_messages(&application->producer_queue, connection);
-    producer_is_empty = !application->producer_queue.messages.head || !application->producer_queue.messages.head->value;
-    if (producer_was_nonempty && producer_is_empty)
-    {
-        (void)rdplib_platform_semaphore_wait(&application->arrival_semaphore, 0);
-    }
-    rdplib_platform_mutex_unlock(&application->producer_lock);
+    rdp_lock_connection(c);
+    rdp = c->cn_rdp;
 
-    rdplib_platform_mutex_lock(&application->consumer_lock);
-    rxq_flush_all_messages(&application->consumer_queue, connection);
-    rdplib_platform_mutex_unlock(&application->consumer_lock);
-    transmit = &connection->transmit;
-
-    if ((transmit->connected && transmit->transmit_stopped) || (transmit->fin_ack_seen && transmit->fin_message_id == transmit->acknowledged_through_message_id))
+    umutex_lock(&rdp->message_rxq_mutex);
+    messages_in_queue = rxq_peek_head(&rdp->message_rxq) != NULL;
+    rxq_flush_all_messages(&rdp->message_rxq, c);
+    if (messages_in_queue && !rxq_peek_head(&rdp->message_rxq))
     {
-        if (result)
-        {
-            *result = 1;
-        }
-        completion_pending = 0;
+        usemaphore_decrement(&rdp->receive_semaphore, 0);
     }
-    else if (!transmit->connected)
-    {
-        if (result)
-        {
-            *result = 0;
-        }
-        completion_pending = 0;
-    }
+    umutex_unlock(&rdp->message_rxq_mutex);
 
-    if (timeout_ms == 0)
+    umutex_lock(&rdp->external_rxq_mutex);
+    rxq_flush_all_messages(&rdp->external_rxq, c);
+    umutex_unlock(&rdp->external_rxq_mutex);
+
+    wait_to_signal = 1;
+    if ((c->tx_connected && c->tx_stopped) || (c->tx_fin_acked && c->tx_fin_msgid == c->tx_acked_thru))
     {
-        if (completion_pending)
+        if (all_acked)
         {
-            if (result)
+            if (c->tx_fin_acked && c->tx_fin_msgid == c->tx_acked_thru)
             {
-                *result = 0;
+#ifdef RDPLIB_DEBUG
+                dpf(0x4000u, "all_acked == TRUE (all messages acknowledged) (no block)\n");
+#endif
             }
-            completion_pending = 0;
+            else if (c->tx_stopped)
+            {
+#ifdef RDPLIB_DEBUG
+                dpf(0x4000u, "all_acked == TRUE (stopped by peer) (no block)\n");
+#endif
+            }
+            *all_acked = 1;
         }
-        (void)rdp_connection_mark_for_delete(connection->owner, connection);
+        wait_to_signal = 0;
+    }
+    else if (!c->tx_connected)
+    {
+        if (all_acked)
+        {
+#ifdef RDPLIB_DEBUG
+            dpf(0x4000u, "all_acked == FALSE (not connected) (no block)\n");
+#endif
+            *all_acked = 0;
+        }
+        wait_to_signal = 0;
+    }
+
+    if (linger_time)
+    {
+        uevent_t *event;
+        uint32_t *status;
+
+        event = NULL;
+        status = NULL;
+        if (wait_to_signal)
+        {
+            event = all_acked_event;
+            status = all_acked;
+        }
+
+#ifdef RDPLIB_DEBUG
+        dpf(0x2000u, "[0x%08x] connection_close\n", (uint32_t)(uintptr_t)c);
+#endif
+        rx_flush_input_buffers(c);
+        c->cn_closed = 1;
+        c->cn_delete_time = linger_time + time_get_ms();
+        c->tx_all_acked_event = event;
+        c->tx_all_acked = status;
+        tx_send_fin(c);
+        rdp_resort(c, 1);
     }
     else
     {
-        rdplib_platform_event_t *installed_event = NULL;
-        int *installed_result = NULL;
-
-        if (completion_pending)
+        if (wait_to_signal)
         {
-            installed_event = completion_event;
-            installed_result = result;
+            if (all_acked)
+            {
+#ifdef RDPLIB_DEBUG
+                dpf(0x4000u, "all_acked == FALSE (no linger)\n");
+#endif
+                *all_acked = 0;
+            }
+            wait_to_signal = 0;
         }
-
-        rx_flush_input_buffers(connection);
-        connection->linger_active = 1;
-        connection->linger_deadline_ms = time_get_ms() + timeout_ms;
-        transmit->close_event = installed_event;
-        transmit->close_result = installed_result;
-        (void)tx_send_fin(connection);
-        rdp_resort(connection, 1);
+        rdp_connection_mark_for_delete(rdp, c);
     }
 
-    if (!completion_pending && completion_event)
+    if (!wait_to_signal && all_acked_event)
     {
-        rdplib_platform_event_signal(completion_event);
+        uevent_signal(all_acked_event);
     }
-
-    rdp_unlock(connection);
+    rdp_unlock(c);
     return RDP_CONNECTION_SEND_OK;
 }
 
-void connection_recalc_event_timeout(connection_t *connection, rdp_timeout_data_t *timeout)
+uint32_t connection_linger_expired(connection_t *c)
 {
-    rdp_transmit_initialization_state_t *transmit = &connection->transmit;
-    rdp_receive_initialization_state_t *receive = &connection->receive;
+    int32_t time_until_delete;
 
-    timeout->infinite = 1;
-    timeout->deadline_ms = 0;
-    connection->event_type = RDP_CONNECTION_EVENT_NONE;
-
-    if (transmit->connected && !transmit->transmit_stopped)
-    {
-        tx_get_event_time(connection, timeout);
-        if (!timeout->infinite)
-        {
-            connection->event_type = RDP_CONNECTION_EVENT_TRANSMIT;
-        }
-    }
-    else if (transmit->connected && transmit->delayed_ack_pending)
-    {
-        connection->event_type = RDP_CONNECTION_EVENT_TRANSMIT;
-        timeout->infinite = 0;
-        timeout->deadline_ms = transmit->delayed_ack_deadline_ms;
-    }
-
-    if ((connection->options & RDP_CONNECTION_FEATURE_KEEPALIVE) && transmit->syn_sent && !transmit->fin_sent && transmit->connected && !transmit->transmit_stopped
-#ifndef RDPLIB_SOURCE_FAITHFUL
-        && (uint16_t)(transmit->reliable_next_message_id - transmit->acknowledged_through_message_id - 1u) < RDP_BITARRAY_BITS - 1u
-#endif
-    )
-    {
-#ifdef RDPLIB_SOURCE_FAITHFUL
-        uint32_t keepalive_deadline_ms = transmit->last_reliable_enqueue_time_ms + 10000u;
-#else
-        uint32_t keepalive_deadline_ms = transmit->last_reliable_enqueue_time_ms + connection->rdplib_keepalive_interval_ms;
-#endif
-
-        if (timeout->infinite || (int32_t)(keepalive_deadline_ms - timeout->deadline_ms) < 0)
-        {
-            connection->event_type = RDP_CONNECTION_EVENT_KEEPALIVE;
-            timeout->infinite = 0;
-            timeout->deadline_ms = keepalive_deadline_ms;
-        }
-    }
-
-    if ((connection->options & RDP_CONNECTION_FEATURE_TRACEROUTE) && receive->trace_sweep_count < RDP_TRACE_SWEEP_LIMIT)
-    {
-        uint32_t trace_deadline_ms = receive->trace_last_send_time_ms;
-
-        if (receive->trace_in_flight)
-        {
-            uint32_t retransmission_delay_ms = (uint32_t)transmit->rtt_estimator.mean_ms + 2u * transmit->rtt_estimator.deviation_ms;
-
-            if (retransmission_delay_ms <= 50u)
-            {
-                retransmission_delay_ms = 50u;
-            }
-            else if (retransmission_delay_ms >= 65535u)
-            {
-                retransmission_delay_ms = 65535u;
-            }
-            trace_deadline_ms += retransmission_delay_ms;
-        }
-        if (timeout->infinite || (int32_t)(trace_deadline_ms - timeout->deadline_ms) < 0)
-        {
-            connection->event_type = RDP_CONNECTION_EVENT_TRACEROUTE;
-            timeout->infinite = 0;
-            timeout->deadline_ms = trace_deadline_ms;
-        }
-    }
-
-    if (connection->linger_active)
-    {
-        if (timeout->infinite || (int32_t)(connection->linger_deadline_ms - timeout->deadline_ms) < 0)
-        {
-            connection->event_type = RDP_CONNECTION_EVENT_LINGER;
-            timeout->infinite = 0;
-            timeout->deadline_ms = connection->linger_deadline_ms;
-        }
-    }
+    time_until_delete = (int32_t)(c->cn_delete_time - time_get_ms());
+    return c->cn_closed && time_until_delete <= 10;
 }
 
-void connection_event_process(connection_t *connection, uint32_t now_ms, rdp_timeout_data_t *timeout)
+// unused, retained for historical interest
+#ifdef RDP_DEAD_CODE
+uint32_t connection_keepalive(connection_t *c, uint32_t on)
 {
-    for (;;)
+    uint32_t flag_mask;
+
+    flag_mask = RDP_CONNECTION_FEATURE_KEEPALIVE;
+    if (!c)
     {
-        switch (connection->event_type)
-        {
-        case RDP_CONNECTION_EVENT_LINGER:
-            return;
-
-        case RDP_CONNECTION_EVENT_TRANSMIT:
-            tx_tx(connection);
-            break;
-
-        case RDP_CONNECTION_EVENT_KEEPALIVE:
-            (void)tx_send_alive(connection);
-            break;
-
-        case RDP_CONNECTION_EVENT_TRACEROUTE:
-            (void)trace_send(connection);
-            break;
-
-        default:
-            break;
-        }
-
-        connection_recalc_event_timeout(connection, timeout);
-        if (timeout->infinite || (int32_t)(now_ms - timeout->deadline_ms) < 0)
-        {
-            return;
-        }
-    }
-}
-
-void connection_handle_icmp(connection_t *connection, uint8_t type, uint8_t code, uint8_t trace_response, uint8_t trace_sample_index, const uint8_t source_address[16])
-{
-    rdp_receive_initialization_state_t *receive = &connection->receive;
-    rdp_receive_statistics_t *statistics = &receive->recording.statistics;
-    uint32_t now_ms = time_get_ms();
-    uint32_t source_ipv4;
-
-    if (trace_response)
-    {
-        trace_sample_t *samples;
-        trace_sample_t *sample;
-
-        if (trace_sample_index >= receive->trace_sample_index || !receive->ownership.trace_samples)
-        {
-            return;
-        }
-
-        samples = (trace_sample_t *)receive->ownership.trace_samples;
-        sample = &samples[trace_sample_index];
-        if (type == 3 && code == 3 && receive->trace_ttl_limit > sample->ttl)
-        {
-            receive->trace_ttl_limit = sample->ttl;
-            if (receive->trace_ttl > sample->ttl)
-            {
-                ++receive->trace_sweep_count;
-                receive->trace_ttl = 1;
-            }
-        }
-
-        sample->round_trip_time_ms = now_ms - sample->sent_time_ms;
-        memcpy(&source_ipv4, source_address + 4, sizeof(source_ipv4));
-        sample->responder_ipv4 = source_ipv4;
-        sample->icmp_type = type;
-        sample->icmp_code = code;
-        receive->trace_in_flight = 0;
-        receive->trace_last_send_time_ms = now_ms;
-        return;
+        return RDP_CONNECTION_SEND_INVALID_ARGUMENT;
     }
 
-    switch (type)
+    rdp_lock_connection(c);
+    if (on)
     {
-    case 3:
-        if (code < 16)
-        {
-            ++g_rdp_stat->icmp_destination_unreachable_by_code[code];
-            ++statistics->icmp_destination_unreachable_by_code[code];
-        }
-        else
-        {
-            ++g_rdp_stat->icmp_invalid_code;
-            ++statistics->icmp_invalid_code_count;
-        }
-        break;
-
-    case 4:
-        ++g_rdp_stat->icmp_source_quench;
-        ++statistics->icmp_source_quench_count;
-        break;
-
-    case 11:
-        if (code < 2)
-        {
-            ++g_rdp_stat->icmp_time_exceeded_by_code[code];
-            ++statistics->icmp_time_exceeded_by_code[code];
-        }
-        else
-        {
-            ++g_rdp_stat->icmp_invalid_code;
-            ++statistics->icmp_invalid_code_count;
-        }
-        break;
-
-    case 12:
-        if (code < 2)
-        {
-            ++g_rdp_stat->icmp_parameter_problem_by_code[code];
-            ++statistics->icmp_parameter_problem_by_code[code];
-        }
-        else
-        {
-            ++g_rdp_stat->icmp_invalid_code;
-            ++statistics->icmp_invalid_code_count;
-        }
-        break;
-
-    default:
-        return;
+        c->cn_flags |= flag_mask;
     }
-
-    ++receive->icmp_count;
-    receive->last_icmp_type = type;
-    receive->last_icmp_code = code;
-    receive->last_icmp_time_ms = time_get_ms();
-    memcpy(&source_ipv4, source_address + 4, sizeof(source_ipv4));
-    receive->last_icmp_source = source_ipv4;
-    if (type == 3 && code == 3)
+    else
     {
-        tx_abort_connection(connection, RDP_DISCONNECT_REASON_ICMP);
+        c->cn_flags &= ~flag_mask;
     }
-}
-
-void connection_record_arrival(connection_t *connection, const _rdp_header_t *header, uint32_t *duplicate_reliable)
-{
-    rdp_receive_recording_state_t *recording = &connection->receive.recording;
-    rdp_receive_statistics_t *statistics = &recording->statistics;
-    *duplicate_reliable = 0;
-    rx_record_packet_arrival(connection);
-
-    if ((header->flags & RDP_FLAG_RESET) != 0 && connection->transmit.connected)
-    {
-        tx_abort_connection(connection, RDP_DISCONNECT_REASON_PEER_RESET);
-        return;
-    }
-
-    if ((header->flags & RDP_FLAG_STOP) != 0 && !connection->transmit.transmit_stopped)
-    {
-        tx_received_stopped(connection);
-    }
-
-    rx_record_seqnum_arrival(connection, header);
-
-    tx_record_ack_arrival(connection, header);
-
-    if ((header->flags & RDP_FLAG_MSGID) != 0)
-    {
-        *duplicate_reliable = (uint32_t)rx_record_msgid_arrival(connection, header->message_id);
-
-        if (*duplicate_reliable)
-        {
-            ++g_rdp_stat->duplicate_reliable_packets_received;
-            g_rdp_stat->duplicate_reliable_payload_bytes_received += header->payload_bytes;
-            ++statistics->duplicate_reliable_packets_received;
-            statistics->duplicate_reliable_payload_bytes_received += header->payload_bytes;
-        }
-        else
-        {
-            ++g_rdp_stat->reliable_packets_received;
-            g_rdp_stat->reliable_payload_bytes_received += header->payload_bytes;
-            ++statistics->reliable_packets_received;
-            statistics->reliable_payload_bytes_received += header->payload_bytes;
-        }
-    }
-    else if (header->payload_bytes)
-    {
-        ++g_rdp_stat->unreliable_packets_received;
-        g_rdp_stat->unreliable_payload_bytes_received += header->payload_bytes;
-        ++statistics->unreliable_packets_received;
-        statistics->unreliable_payload_bytes_received += header->payload_bytes;
-    }
-
-    g_rdp_stat->received_header_bytes += header->header_bytes;
-    statistics->received_header_bytes += header->header_bytes;
-
-    if ((header->flags & RDP_FLAG_MSGID) != 0)
-    {
-        tx_set_delayed_ack(connection);
-    }
-}
-
-#ifndef RDPLIB_SOURCE_FAITHFUL
-static rdp_rx_arrival_disposition_t rdplib_connection_abort_short_datagram(connection_t *connection)
-{
-    ++g_rdp_stat->short_datagrams;
-    ++connection->receive.recording.statistics.short_packet_count;
-    if (connection->transmit.connected)
-    {
-        tx_abort_connection(connection, RDP_DISCONNECT_REASON_PROTOCOL_ERROR);
-    }
-    return RDP_RX_ABORT;
-}
-
-static rdp_rx_arrival_disposition_t rdplib_connection_abort_invalid_fragment(connection_t *connection)
-{
-    ++g_rdp_stat->invalid_fragment_headers;
-    ++connection->receive.recording.statistics.invalid_fragment_count;
-    if (connection->transmit.connected)
-    {
-        tx_abort_connection(connection, RDP_DISCONNECT_REASON_PROTOCOL_ERROR);
-    }
-    return RDP_RX_ABORT;
+    rdp_resort(c, 1);
+    rdp_unlock(c);
+    return RDP_CONNECTION_SEND_OK;
 }
 #endif
 
-rdp_rx_arrival_disposition_t connection_parse_and_validate_arrival(connection_t *connection, const uint8_t *packet, uint16_t packet_bytes, _rdp_header_t *header)
+void connection_set_send_buffer_size(connection_t *c, uint32_t send_buffer_size)
 {
-#ifndef RDPLIB_SOURCE_FAITHFUL
-    uint32_t required_bytes;
-    uint32_t fragment_offset = 0;
-    uint16_t flags;
-    uint16_t acknowledgement_base_flags;
+    c->tx_send_buffer_size = send_buffer_size;
+}
 
-    if (!connection || !packet || !header || packet_bytes < sizeof(uint16_t))
+// unused, retained for historical interest
+#ifdef RDP_DEAD_CODE
+uint32_t connection_set_timeouts(connection_t *c, uint32_t max_message_age, uint32_t max_service_outage)
+{
+    uint32_t result;
+
+    result = RDP_CONNECTION_SEND_INVALID_ARGUMENT;
+    if (c)
     {
-        return RDP_RX_ABORT;
+        rdp_lock_connection(c);
+        c->tx_max_message_age = max_message_age;
+        c->tx_max_service_outage = max_service_outage;
+        rdp_unlock(c);
+        return RDP_CONNECTION_SEND_OK;
     }
-
-    flags = rdplib_load_network_u16(packet);
-    if (((flags & (RDP_FLAG_SYN | RDP_FLAG_FIN | RDP_FLAG_FRAGMENT)) == 0 || (flags & RDP_FLAG_MSGID) != 0) && (flags & RDP_FLAG_MULTI) == 0)
-    {
-        required_bytes = 4;
-        acknowledgement_base_flags = flags & (RDP_FLAG_ACKTHRU | RDP_FLAG_MASKOFFSET);
-        if (acknowledgement_base_flags == RDP_FLAG_ACKTHRU || acknowledgement_base_flags == RDP_FLAG_MASKOFFSET)
-        {
-            required_bytes += 2u + ((flags & RDP_FLAG_ACK_MASK_LENGTH) >> 4);
-        }
-        if ((flags & RDP_FLAG_MSGID) != 0)
-        {
-            required_bytes += 2;
-        }
-        if ((flags & RDP_FLAG_FRAGMENT) != 0)
-        {
-            fragment_offset = required_bytes;
-            required_bytes += 6;
-        }
-        if ((flags & RDP_FLAG_SEQUENCED) != 0)
-        {
-            ++required_bytes;
-            if ((flags & RDP_FLAG_MSGID) != 0)
-            {
-                ++required_bytes;
-            }
-        }
-
-        if (required_bytes > packet_bytes)
-        {
-            return rdplib_connection_abort_short_datagram(connection);
-        }
-        if (fragment_offset)
-        {
-            uint32_t payload_bytes = packet_bytes - required_bytes;
-
-            if (rdplib_load_network_u16(packet + fragment_offset + 4u) > 100u || payload_bytes < 1u || payload_bytes > RDP_FRAGMENT_PAYLOAD_BYTES)
-            {
-                return rdplib_connection_abort_invalid_fragment(connection);
-            }
-        }
-    }
+    return result;
+}
 #endif
 
-    rdp_receive_recording_state_t *recording = &connection->receive.recording;
-    rdp_receive_statistics_t *statistics = &recording->statistics;
-    const uint8_t *cursor = packet;
-    rdp_rx_arrival_disposition_t disposition = RDP_RX_ACCEPT;
-    uint32_t acknowledgement_bytes;
-    uint16_t required_message_id_flags;
+uint32_t connection_connected(connection_t *c)
+{
+    return c->tx_connected;
+}
 
-    header->flags = rdplib_load_network_u16(cursor);
-    cursor += 2;
-    required_message_id_flags = header->flags & (RDP_FLAG_SYN | RDP_FLAG_FIN | RDP_FLAG_FRAGMENT);
-    if ((required_message_id_flags && (header->flags & RDP_FLAG_MSGID) == 0) || (header->flags & RDP_FLAG_MULTI) != 0)
+void **connection_app_ptr(connection_t *c)
+{
+    return c->cn_app_ptr;
+}
+
+struct sockaddr *connection_get_remote_addr(connection_t *c)
+{
+    return &c->tx_remote_addr;
+}
+
+// unused, retained for historical interest
+#ifdef RDP_DEAD_CODE
+uint32_t connection_get_last_rt_time(connection_t *c)
+{
+    return c->tx_last_rt_time;
+}
+#endif
+
+void connection_get_perf_stats(connection_t *c, perf_stats_t *stats)
+{
+    rdp_lock_connection(c);
+    stats->time_last_arrival = c->rx_time_last_arrival;
+    stats->recent_seqnum_history = c->rx_recent_seqnum_history;
+    stats->highest_seqnum_received = c->rx_highest_seqnum_received;
+    stats->average_rt_time = c->tx_rt_tracker.weighted_avg;
+    stats->std_deviation = c->tx_rt_tracker.std_deviation;
+    stats->last_rt_time = c->tx_last_rt_time;
+    stats->queue_size = tx_get_queue_size(c);
+    stats->stall_time = tx_get_stall_time(c);
+    rdp_unlock(c);
+
+    if (c->tx_remote_addr.sa_family == 69)
     {
-        ++g_rdp_stat->invalid_datagram_flags;
-        ++statistics->invalid_datagram_flags_count;
-        disposition = RDP_RX_ABORT;
-        goto finished;
+        stats->stall_time = rdp_get_serial_stall_time(c->cn_rdp);
     }
+}
 
-    header->sequence = rdplib_load_network_u16(cursor);
-    cursor += 2;
-    disposition = rx_validate_seqnum_arrival(connection, header->sequence);
-    if (disposition != RDP_RX_ACCEPT)
+void connection_get_disconnect_info(connection_t *c, disconnect_info_t *info, uint32_t size)
+{
+    if (size == sizeof(*info))
     {
-        goto finished;
+        info->disconnect_reason = c->tx_disconnect_reason;
+        info->icmp_code = c->rx_icmp_code;
+        info->icmp_type = c->rx_icmp_type;
+        info->icmp_from = c->rx_icmp_from.s_addr;
     }
-
-    header->ack_data = cursor;
-    disposition = tx_validate_ack_arrival(connection, header, &acknowledgement_bytes);
-    if (disposition != RDP_RX_ACCEPT)
+    else
     {
-        goto finished;
+#ifdef RDPLIB_DEBUG
+        assert(!"invalid disconnect_info_t size");
+#endif
     }
-    cursor += acknowledgement_bytes;
-
-    if ((header->flags & RDP_FLAG_MSGID) != 0)
-    {
-        header->message_id = rdplib_load_network_u16(cursor);
-        cursor += 2;
-        disposition = rx_validate_msgid_arrival(connection, header);
-        if (disposition != RDP_RX_ACCEPT)
-        {
-            goto finished;
-        }
-    }
-
-    header->fragment_id = 0;
-    header->fragment_index = 0;
-    header->fragment_count = 1;
-    if ((header->flags & RDP_FLAG_FRAGMENT) != 0)
-    {
-        header->fragment_id = rdplib_load_network_u16(cursor);
-        header->fragment_index = rdplib_load_network_u16(cursor + 2);
-        header->fragment_count = rdplib_load_network_u16(cursor + 4);
-        cursor += 6;
-    }
-
-    if ((header->flags & RDP_FLAG_SEQUENCED) != 0)
-    {
-        header->stream_id = *cursor++;
-        if ((header->flags & RDP_FLAG_MSGID) != 0)
-        {
-            header->stream_sequence = *cursor++;
-        }
-
-        disposition = rx_validate_stream_arrival(connection, header);
-        if (disposition != RDP_RX_ACCEPT)
-        {
-            goto finished;
-        }
-    }
-
-    header->header_bytes = (uint16_t)(cursor - packet);
-    if (packet_bytes < header->header_bytes)
-    {
-        ++g_rdp_stat->short_datagrams;
-        ++statistics->short_packet_count;
-        disposition = RDP_RX_ABORT;
-        goto finished;
-    }
-
-    header->payload_bytes = (uint16_t)(packet_bytes - header->header_bytes);
-    if ((header->flags & RDP_FLAG_FRAGMENT) != 0)
-    {
-        disposition = rx_validate_fragment_arrival(connection, header);
-    }
-
-finished:
-    if (disposition == RDP_RX_ABORT && connection->transmit.connected)
-    {
-        tx_abort_connection(connection, RDP_DISCONNECT_REASON_PROTOCOL_ERROR);
-    }
-    return disposition;
 }

@@ -1,67 +1,91 @@
 // Copyright (c) 2026 solar@heliacal.net
 // SPDX-License-Identifier: MIT
 
-#include "rdplib_platform.h"
+#include "uthread.h"
 
+#include <pthread.h>
 #include <stdlib.h>
 
-typedef struct rdplib_platform_thread_record_t
+typedef struct rdplib_posix_thread_t
 {
     pthread_t thread;
-    rdplib_platform_thread_entry_t entry;
-    void *argument;
-} rdplib_platform_thread_record_t;
+} rdplib_posix_thread_t;
 
-static void *rdplib_platform_thread_start(void *argument)
+static void *rdplib_posix_thread_start(void *data);
+
+uint32_t uthread_wait_exit_code(uthread_t *thread, uint32_t *exit_code)
 {
-    rdplib_platform_thread_record_t *thread = (rdplib_platform_thread_record_t *)argument;
-    rdplib_platform_thread_entry_t entry = thread->entry;
-    void *entry_argument = thread->argument;
-    return (void *)(uintptr_t)entry(entry_argument);
+    rdplib_posix_thread_t *handle;
+    void *result;
+    int wait_result;
+
+    if (thread->handle == NULL)
+    {
+        *exit_code = UINT32_MAX;
+        return 0;
+    }
+
+    handle = (rdplib_posix_thread_t *)thread->handle;
+    result = NULL;
+    wait_result = pthread_join(handle->thread, &result);
+    *exit_code = (uint32_t)(uintptr_t)result;
+    return wait_result == 0 ? 0u : UINT32_MAX;
 }
 
-int rdplib_platform_thread_create(void **thread_output, rdplib_platform_thread_entry_t entry, void *argument)
+void uthread_init(uthread_t *thread)
 {
-    rdplib_platform_thread_record_t *thread = (rdplib_platform_thread_record_t *)malloc(sizeof(*thread));
-    int result;
+    thread->handle = NULL;
+}
 
-    if (!thread)
+void uthread_destroy(uthread_t *thread)
+{
+    rdplib_posix_thread_t *handle;
+
+    handle = (rdplib_posix_thread_t *)thread->handle;
+    if (handle != NULL)
     {
-        return 2;
+        if (pthread_equal(handle->thread, pthread_self()))
+        {
+            (void)pthread_detach(handle->thread);
+        }
+        free(handle);
     }
-    thread->entry = entry;
-    thread->argument = argument;
-    result = pthread_create(&thread->thread, NULL, rdplib_platform_thread_start, thread);
-    if (result != 0)
-    {
-        free(thread);
-        return 1;
-    }
-    *thread_output = thread;
+}
+
+uint32_t RDP_STDCALL start_routine(void *data)
+{
+    uthread_t *thread;
+
+    thread = (uthread_t *)data;
+    thread->proc(thread->data);
     return 0;
 }
 
-void rdplib_platform_thread_wait(void *thread_pointer, uint32_t *exit_code)
+static void *rdplib_posix_thread_start(void *data)
 {
-    rdplib_platform_thread_record_t *thread = (rdplib_platform_thread_record_t *)thread_pointer;
-    void *result = NULL;
-    (void)pthread_join(thread->thread, &result);
-    if (exit_code)
-    {
-        *exit_code = (uint32_t)(uintptr_t)result;
-    }
+    return (void *)(uintptr_t)start_routine(data);
 }
 
-void rdplib_platform_thread_destroy(void *thread_pointer)
+uint32_t uthread_create(uthread_t *thread, uthread_f proc, void *data)
 {
-    rdplib_platform_thread_record_t *thread = (rdplib_platform_thread_record_t *)thread_pointer;
-    if (!thread)
+    rdplib_posix_thread_t *handle;
+
+    thread->proc = proc;
+    thread->data = data;
+    handle = (rdplib_posix_thread_t *)malloc(sizeof(*handle));
+    if (handle == NULL)
     {
-        return;
+        thread->handle = NULL;
+        return 1;
     }
-    if (pthread_equal(thread->thread, pthread_self()))
+
+    thread->handle = handle;
+    if (pthread_create(&handle->thread, NULL, rdplib_posix_thread_start, thread) != 0)
     {
-        (void)pthread_detach(thread->thread);
+        free(handle);
+        thread->handle = NULL;
+        return 1;
     }
-    free(thread);
+    thread->id = 0;
+    return 0;
 }

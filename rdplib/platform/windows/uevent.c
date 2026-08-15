@@ -1,33 +1,65 @@
 // Copyright (c) 2026 solar@heliacal.net
 // SPDX-License-Identifier: MIT
 
-#include "rdplib_platform.h"
+#include "uevent.h"
 
-void rdplib_platform_event_init(rdplib_platform_event_t *event)
+#ifdef RDPLIB_DEBUG
+#include <assert.h>
+#endif
+#include <string.h>
+
+void uevent_init(uevent_t *event)
 {
-    event->handle = NULL;
+    memset(event, 0, sizeof(*event));
 }
 
-int rdplib_platform_event_create(rdplib_platform_event_t *event)
+uint32_t uevent_create(uevent_t *event)
 {
-    event->handle = CreateEventA(NULL, FALSE, FALSE, NULL);
-    return event->handle ? 0 : 3;
+    event->event = CreateEventA(NULL, FALSE, FALSE, NULL);
+    return event->event != NULL ? 0u : 3u;
 }
 
-void rdplib_platform_event_destroy(rdplib_platform_event_t *event)
+void uevent_destroy(uevent_t *event)
 {
-    if (event->handle)
+    uint32_t closed;
+
+    if (event->event != NULL)
     {
-        (void)CloseHandle(event->handle);
+        closed = (uint32_t)CloseHandle(event->event);
+#ifdef RDPLIB_DEBUG
+        assert(closed);
+#else
+        (void)closed;
+#endif
     }
 }
 
-void rdplib_platform_event_signal(rdplib_platform_event_t *event)
+void uevent_signal(uevent_t *event)
 {
-    (void)SetEvent(event->handle);
+    uint32_t set;
+
+#ifdef RDPLIB_DEBUG
+    assert(event->event != NULL);
+#endif
+    set = (uint32_t)SetEvent(event->event);
+#ifdef RDPLIB_DEBUG
+    assert(set);
+#else
+    (void)set;
+#endif
 }
 
-int rdplib_platform_event_wait(rdplib_platform_event_t *event)
+void uevent_wait(uevent_t *event)
 {
-    return (int)WaitForSingleObjectEx(event->handle, INFINITE, FALSE);
+    uint32_t wait;
+
+#ifdef RDPLIB_DEBUG
+    assert(event->event != NULL);
+#endif
+    wait = (uint32_t)WaitForSingleObjectEx(event->event, INFINITE, FALSE);
+#ifdef RDPLIB_DEBUG
+    assert(wait == WAIT_OBJECT_0);
+#else
+    (void)wait;
+#endif
 }

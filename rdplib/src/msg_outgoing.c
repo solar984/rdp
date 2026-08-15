@@ -1,51 +1,73 @@
 // Copyright (c) 2026 solar@heliacal.net
 // SPDX-License-Identifier: MIT
 
-#include "packet.h"
+#include "msg_outgoing.h"
 
 #include <string.h>
 
+#ifdef RDPLIB_DEBUG
+#include <assert.h>
+#endif
+
 #include "rdplib_constants.h"
 #include "rdplib_platform.h"
+#ifdef RDPLIB_DEBUG
+#include "utime.h"
+#define RDP_HEADER_OPTION_MSGID RDP_FLAG_MSGID
+#endif
 
-void msg_outgoing_init(msg_outgoing_t *message)
+void msg_outgoing_init(msg_outgoing_t *outgoing)
 {
-    uint8_t *data = msg_outgoing_data(message);
-    uint16_t network_value;
+    uint16_t msgid;
+    uint16_t fragid;
+    uint16_t frag_total;
+    uint16_t frag_number;
 
-    message->link.value = message;
-    message->link.key = NULL;
-    message->serialized_bytes = 0;
-    message->transmission_count = 0;
+    outgoing->txq_link.item = outgoing;
+    outgoing->txq_link.key.p = NULL;
+    outgoing->size = 0;
+    outgoing->attempts = 0;
 
-    if (message->flags & RDP_FLAG_MSGID)
+    if (outgoing->options & RDP_FLAG_MSGID)
     {
-        network_value = htons(message->message_id);
-        memcpy(data + message->serialized_bytes, &network_value, sizeof(network_value));
-        message->serialized_bytes += sizeof(network_value);
+        msgid = htons(outgoing->msgid);
+        memcpy(msg_outgoing_get_data(outgoing) + outgoing->size, &msgid, sizeof(msgid));
+        outgoing->size += sizeof(msgid);
     }
 
-    if (message->flags & RDP_FLAG_FRAGMENT)
+    if (outgoing->options & RDP_FLAG_FRAGMENT)
     {
-        network_value = htons(message->fragment_id);
-        memcpy(data + message->serialized_bytes, &network_value, sizeof(network_value));
-        message->serialized_bytes += sizeof(network_value);
-        network_value = htons(message->fragment_index);
-        memcpy(data + message->serialized_bytes, &network_value, sizeof(network_value));
-        message->serialized_bytes += sizeof(network_value);
-        network_value = htons(message->fragment_count);
-        memcpy(data + message->serialized_bytes, &network_value, sizeof(network_value));
-        message->serialized_bytes += sizeof(network_value);
+#ifdef RDPLIB_DEBUG
+        assert(outgoing->options & RDP_HEADER_OPTION_MSGID);
+#endif
+
+        fragid = htons(outgoing->fragid);
+        memcpy(msg_outgoing_get_data(outgoing) + outgoing->size, &fragid, sizeof(fragid));
+        outgoing->size += sizeof(fragid);
+
+        frag_number = htons(outgoing->frag_number);
+        memcpy(msg_outgoing_get_data(outgoing) + outgoing->size, &frag_number, sizeof(frag_number));
+        outgoing->size += sizeof(frag_number);
+
+        frag_total = htons(outgoing->frag_total);
+        memcpy(msg_outgoing_get_data(outgoing) + outgoing->size, &frag_total, sizeof(frag_total));
+        outgoing->size += sizeof(frag_total);
     }
 
-    if (message->flags & RDP_FLAG_SEQUENCED)
+    if (outgoing->options & RDP_FLAG_SEQUENCED)
     {
-        data[message->serialized_bytes++] = message->stream_id;
-        if (message->flags & RDP_FLAG_MSGID)
+        msg_outgoing_get_data(outgoing)[outgoing->size] = (char)outgoing->stream;
+        ++outgoing->size;
+        if (outgoing->options & RDP_FLAG_MSGID)
         {
-            data[message->serialized_bytes++] = message->stream_sequence;
+            msg_outgoing_get_data(outgoing)[outgoing->size] = (char)outgoing->stream_seqnum;
+            ++outgoing->size;
         }
     }
 
-    message->_f002C = 0;
+#ifdef RDPLIB_DEBUG
+    outgoing->enqueue_time = time_get_ms();
+#else
+    outgoing->enqueue_time = 0;
+#endif
 }

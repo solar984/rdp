@@ -1,25 +1,55 @@
 // Copyright (c) 2026 solar@heliacal.net
 // SPDX-License-Identifier: MIT
 
-#ifdef _MSC_VER
+#if defined(_MSC_VER) && (defined(RDPLIB_DEBUG) || defined(RDPLIB_SOURCE_FAITHFUL))
 #define _CRT_SECURE_NO_WARNINGS
+#define _WINSOCK_DEPRECATED_NO_WARNINGS
 #endif
 
 #include "rdp.h"
 
+#if defined(RDPLIB_DEBUG) || defined(RDPLIB_SOURCE_FAITHFUL)
 #include <stdio.h>
+#endif
 #include <string.h>
 
+#include "crc.h"
+#include "cypher.h"
+#ifdef RDPLIB_DEBUG
+#include "dpf.h"
+#endif
 #include "fast.h"
-#include "framing.h"
-#include "net_error.h"
+#ifdef RDPLIB_SOURCE_FAITHFUL
+#include "log.h"
+#endif
+#ifdef RDPLIB_DEBUG
+#include "protocol_limits.h"
+#endif
+#ifndef RDPLIB_SOURCE_FAITHFUL
 #include "rdplib_wire.h"
+#endif
+#include "rdplib_rdp.h"
+#include "rxq.h"
+#if defined(RDPLIB_DEBUG) || defined(RDPLIB_SOURCE_FAITHFUL)
+#include "ustrerror.h"
+#endif
+
+#ifdef RDPLIB_DEBUG
+#define URESULT_OK 0u
+#ifndef INVALID_HANDLE_VALUE
+#define INVALID_HANDLE_VALUE ((void *)(intptr_t)-1)
+#endif
+#endif
+
+uint32_t disable_blocking(intptr_t s);
 
 enum
 {
     RDP_SOCKET_TYPE_DATAGRAM = 2,
     RDP_SOCKET_TYPE_RAW = 3,
     RDP_SOCKET_LEVEL = 0xFFFF,
+    RDP_SOCKET_SEND_BUFFER = 0x1001,
+    RDP_SOCKET_RECEIVE_BUFFER = 0x1002,
     RDP_SOCKET_BROADCAST = 32,
     RDP_IP_LEVEL = 0,
     RDP_IP_TTL = 7,
@@ -27,1239 +57,1923 @@ enum
     RDP_SOCKET_ERROR_OPTION_UNSUPPORTED = 10042
 };
 
-static uint16_t load_native_u16(const uint8_t *bytes)
-{
-    uint16_t value;
-    memcpy(&value, bytes, sizeof(value));
-    return value;
-}
-
-static int format_ipv4(char *output, const uint8_t address[16])
-{
-    return sprintf(output, "AF_INET %u.%u.%u.%u:%u", address[4], address[5], address[6], address[7], rdplib_load_network_u16(address + 2));
-}
-
-int rdp_format_sockaddr_mac(char *output, const uint8_t address[16])
-{
-    uint32_t family = address[1];
-
-    if (family == 6)
-    {
-        return (int)family;
-    }
-    if (family == 69)
-    {
-        uint32_t port = (uint32_t)(int32_t)(int16_t)load_native_u16(address + 2);
-        return sprintf(output, "AF_COMPORT %u", port);
-    }
-    if (family == 2)
-    {
-        return format_ipv4(output, address);
-    }
-    return sprintf(output, "unknown address family (%u)", family);
-}
-
-int rdp_format_sockaddr_windows(char *output, const uint8_t address[16])
-{
-    uint32_t family = load_native_u16(address);
-
-    switch (family)
-    {
-    case 2:
-        return format_ipv4(output, address);
-    case 6:
-    {
-        char node[16];
-        char network[16];
-
-        // The MSVC source passes both uninitialized arrays to %s. This can read past either array and overrun output; family 6 is not a normal game RDP endpoint.
-        return sprintf(output, "AF_IPX %s:%s:%u", node, network, load_native_u16(address + 12));
-    }
-    case 69:
-    {
-        uint32_t port = (uint32_t)(int32_t)(int16_t)load_native_u16(address + 2);
-        return sprintf(output, "AF_COMPORT %u", port);
-    }
-    default:
-        return sprintf(output, "unknown address family (%u)", family);
-    }
-}
-
-void rdp_init(rdp_t *owner)
-{
-    owner->sockets_initialized = 0;
-    owner->ipv4_socket = -1;
-    owner->icmp_receive_socket = -1;
-    owner->icmp_probe_socket = -1;
-    owner->ipx_socket = -1;
-    memset(owner->ipv4_address, 0, sizeof(owner->ipv4_address));
-    memset(owner->probe_address, 0, sizeof(owner->probe_address));
-    memset(owner->ipx_address, 0, sizeof(owner->ipx_address));
-    owner->probe_socket_default_ttl = 0;
-    owner->ipx_broadcast_enabled = 0;
-    owner->ipv4_broadcast_enabled = 0;
-    owner->input_bytes = 0;
-    owner->duplicate_input_bytes = 0;
-    owner->duplicate_input_bytes_per_second = 0;
-
-    serial_init(&owner->serial);
-    connhash_init(&owner->connections);
-    memset(&owner->events, 0, sizeof(owner->events));
-    owner->io_wakeup_pending = 0;
-    owner->io_thread = NULL;
-
-    memset(&owner->application_receive, 0, sizeof(owner->application_receive));
-    rdplib_platform_semaphore_init(&owner->application_receive.arrival_semaphore);
-    list_init(&owner->application_receive.producer_queue.messages);
-    list_init(&owner->application_receive.consumer_queue.messages);
-    rdplib_platform_mutex_init(&owner->application_receive.producer_lock);
-    rdplib_platform_mutex_init(&owner->application_receive.consumer_lock);
-    owner->rate_sample_time_ms = rdplib_platform_current_time_ms();
-}
-
-int rdp_create(rdp_t **output, uint16_t local_port, uint32_t expected_connections, uint32_t flags)
-{
-    rdp_t *owner;
-    uint8_t bind_address[16];
-    uint32_t address_bytes;
-    uint32_t option_value;
-#ifdef RDPLIB_SOURCE_FAITHFUL
-    uint32_t option_bytes;
+#ifdef RDPLIB_DEBUG
+static uint16_t rdplib_rdp_load_native_u16(const void *bytes);
 #endif
-    uint16_t bucket_count;
-    uint16_t address_family;
-    uint16_t network_port;
-    int udp_protocol;
-    int result;
 
-    *output = NULL;
-    owner = (rdp_t *)rdplib_platform_malloc(sizeof(*owner));
-    if (!owner)
-    {
-        return RDP_CREATE_ALLOCATION_FAILED;
-    }
+uint16_t g_next_local_port = 1024;
 
-    rdp_init(owner);
-    result = RDP_CREATE_FAILED;
-    if (rdplib_platform_network_startup(UINT16_C(0x0101)) != 0)
-    {
-        goto failed;
-    }
-    owner->sockets_initialized = 1;
-
-    result = serial_create(&owner->serial, rdplib_platform_next_serial_port());
-    if (result != 0)
-    {
-        goto failed;
-    }
-    serial_set_time_next_recv(&owner->serial, rdplib_platform_current_time_ms());
-
-    bucket_count = expected_connections == 1 ? 1 : 12;
-    result = connhash_create(&owner->connections, bucket_count);
-    if (result != 0)
-    {
-        goto failed;
-    }
-    result = eventq_create(&owner->events);
-    if (result != 0)
-    {
-        goto failed;
-    }
-    result = rdplib_platform_semaphore_create(&owner->application_receive.arrival_semaphore);
-    if (result != 0)
-    {
-        goto failed;
-    }
-
-    udp_protocol = rdplib_platform_protocol_number("udp", 17);
-    if ((flags & (RDP_CREATE_ATTEMPT_BOTH | RDP_CREATE_REQUIRE_IPV4)) != 0)
-    {
-        owner->ipv4_socket = rdplib_platform_socket_create(RDP_TRANSMIT_ADDRESS_IPV4, RDP_SOCKET_TYPE_DATAGRAM, udp_protocol);
-    }
-    if ((flags & RDP_CREATE_REQUIRE_IPV4) != 0 && owner->ipv4_socket == -1)
-    {
-        result = RDP_CREATE_REQUIRED_TRANSPORT_UNAVAILABLE;
-        goto failed;
-    }
-
-    if ((flags & (RDP_CREATE_ATTEMPT_BOTH | RDP_CREATE_REQUIRE_LEGACY)) != 0)
-    {
-        owner->ipx_socket = rdplib_platform_socket_create(RDP_TRANSMIT_ADDRESS_IPX, RDP_SOCKET_TYPE_DATAGRAM, 1000);
-    }
-    if ((flags & RDP_CREATE_REQUIRE_LEGACY) != 0 && owner->ipx_socket == -1)
-    {
-        result = RDP_CREATE_REQUIRED_TRANSPORT_UNAVAILABLE;
-        goto failed;
-    }
-
-    if (owner->ipv4_socket != -1)
-    {
-        memset(owner->ipv4_address, 0, sizeof(owner->ipv4_address));
-        address_family = RDP_TRANSMIT_ADDRESS_IPV4;
-        network_port = htons(local_port);
-        memcpy(owner->ipv4_address, &address_family, sizeof(address_family));
-        memcpy(owner->ipv4_address + 2, &network_port, sizeof(network_port));
-        if (rdplib_platform_socket_bind(owner->ipv4_socket, owner->ipv4_address, sizeof(owner->ipv4_address)) != 0)
-        {
-            result = rdplib_platform_last_socket_error() == RDP_SOCKET_ERROR_ADDRESS_IN_USE ? RDP_CREATE_ADDRESS_IN_USE : RDP_CREATE_FAILED;
-            goto failed;
-        }
-
-        option_value = 1;
-        owner->ipv4_broadcast_enabled = rdplib_platform_socket_set_option(owner->ipv4_socket, RDP_SOCKET_LEVEL, RDP_SOCKET_BROADCAST, &option_value, sizeof(option_value)) == 0;
-        address_bytes = sizeof(owner->ipv4_address);
-        if (rdplib_platform_socket_get_name(owner->ipv4_socket, owner->ipv4_address, &address_bytes) != 0)
-        {
-            result = RDP_CREATE_FAILED;
-            goto failed;
-        }
-        result = rdplib_platform_socket_disable_blocking(owner->ipv4_socket);
-        if (result != 0)
-        {
-            goto failed;
-        }
-
-#ifndef RDPLIB_SOURCE_FAITHFUL
-#if defined(__linux__) || defined(_WIN32)
-        // The checked build uses errors attributed by the UDP socket. This
-        // works without raw socket privileges and identifies the exact peer
-        // on a shared endpoint.
-        if (rdplib_platform_enable_icmp_errors(owner->ipv4_socket) != 0)
-        {
-            rdplib_platform_record_socket_error(rdplib_platform_last_socket_error());
-        }
-#endif
-#else
-        owner->icmp_receive_socket = rdplib_platform_socket_create(RDP_TRANSMIT_ADDRESS_IPV4, RDP_SOCKET_TYPE_RAW, rdplib_platform_protocol_number("icmp", 1));
-        if (owner->icmp_receive_socket == -1)
-        {
-            rdplib_platform_record_socket_error(rdplib_platform_last_socket_error());
-            goto ipv4_complete;
-        }
-
-        result = rdplib_platform_socket_disable_blocking(owner->icmp_receive_socket);
-        if (result != 0)
-        {
-            goto failed;
-        }
-        memset(bind_address, 0, sizeof(bind_address));
-        memcpy(bind_address, &address_family, sizeof(address_family));
-        if (rdplib_platform_socket_bind(owner->icmp_receive_socket, bind_address, sizeof(bind_address)) != 0)
-        {
-            result = RDP_CREATE_FAILED;
-            goto failed;
-        }
-
-        owner->icmp_probe_socket = rdplib_platform_socket_create(RDP_TRANSMIT_ADDRESS_IPV4, RDP_SOCKET_TYPE_DATAGRAM, udp_protocol);
-        if (owner->icmp_probe_socket == -1)
-        {
-            result = RDP_CREATE_FAILED;
-            goto failed;
-        }
-        memset(owner->probe_address, 0, sizeof(owner->probe_address));
-        memcpy(owner->probe_address, &address_family, sizeof(address_family));
-        if (rdplib_platform_socket_bind(owner->icmp_probe_socket, owner->probe_address, sizeof(owner->probe_address)) != 0)
-        {
-            result = RDP_CREATE_FAILED;
-            goto failed;
-        }
-        address_bytes = sizeof(owner->probe_address);
-        if (rdplib_platform_socket_get_name(owner->icmp_probe_socket, owner->probe_address, &address_bytes) != 0)
-        {
-            result = RDP_CREATE_FAILED;
-            goto failed;
-        }
-        result = rdplib_platform_socket_disable_blocking(owner->icmp_probe_socket);
-        if (result != 0)
-        {
-            goto failed;
-        }
-
-        option_bytes = sizeof(owner->probe_socket_default_ttl);
-        if (rdplib_platform_socket_get_option(owner->icmp_probe_socket, RDP_IP_LEVEL, RDP_IP_TTL, &owner->probe_socket_default_ttl, &option_bytes) != 0)
-        {
-            if (rdplib_platform_last_socket_error() == RDP_SOCKET_ERROR_OPTION_UNSUPPORTED)
-            {
-                rdplib_platform_socket_close(owner->icmp_probe_socket);
-                owner->icmp_probe_socket = -1;
-                goto ipv4_complete;
-            }
-            rdplib_platform_record_socket_error(rdplib_platform_last_socket_error());
-            result = RDP_CREATE_FAILED;
-            goto failed;
-        }
-
-        if (rdplib_platform_socket_set_option(owner->icmp_probe_socket, RDP_IP_LEVEL, RDP_IP_TTL, &owner->probe_socket_default_ttl, sizeof(owner->probe_socket_default_ttl)) != 0)
-        {
-            if (rdplib_platform_last_socket_error() == RDP_SOCKET_ERROR_OPTION_UNSUPPORTED)
-            {
-                rdplib_platform_socket_close(owner->icmp_probe_socket);
-                owner->icmp_probe_socket = -1;
-                goto ipv4_complete;
-            }
-            rdplib_platform_record_socket_error(rdplib_platform_last_socket_error());
-            result = RDP_CREATE_FAILED;
-            goto failed;
-        }
-#endif
-    }
-
-#ifdef RDPLIB_SOURCE_FAITHFUL
-ipv4_complete:
-#endif
-    if (owner->ipx_socket != -1)
-    {
-        memset(bind_address, 0, 14);
-        address_family = RDP_TRANSMIT_ADDRESS_IPX;
-        memcpy(bind_address, &address_family, sizeof(address_family));
-        memcpy(bind_address + 12, &local_port, sizeof(local_port));
-        if (rdplib_platform_socket_bind(owner->ipx_socket, bind_address, 14) != 0)
-        {
-            result = rdplib_platform_last_socket_error() == RDP_SOCKET_ERROR_ADDRESS_IN_USE ? RDP_CREATE_ADDRESS_IN_USE : RDP_CREATE_FAILED;
-            goto failed;
-        }
-
-        option_value = 1;
-        owner->ipx_broadcast_enabled = rdplib_platform_socket_set_option(owner->ipx_socket, RDP_SOCKET_LEVEL, RDP_SOCKET_BROADCAST, &option_value, sizeof(option_value)) == 0;
-        address_bytes = 14;
-        if (rdplib_platform_socket_get_name(owner->ipx_socket, owner->ipx_address, &address_bytes) != 0)
-        {
-            result = RDP_CREATE_FAILED;
-            goto failed;
-        }
-        result = rdplib_platform_socket_disable_blocking(owner->ipx_socket);
-        if (result != 0)
-        {
-            goto failed;
-        }
-    }
-
-    owner->use_encryption = flags >> 31;
-    owner->use_crc = (flags >> 30) & 1u;
-    owner->io_thread_running = 1;
-    result = rdplib_platform_thread_create(&owner->io_thread, (rdplib_platform_thread_entry_t)rdp_io_thread, owner);
-    if (result != 0)
-    {
-        owner->io_thread_running = 0;
-        goto failed;
-    }
-
-    *output = owner;
-    return RDP_CREATE_OK;
-
-failed:
-    owner->join_io_thread_on_destroy = 0;
-    rdp_destroy_internal(owner);
-    return result;
-}
-
-int rdp_connection_create_internal(rdp_t *owner, connection_t **output, const uint8_t endpoint[16], uint32_t options)
+uint32_t rdp_wake(rdp_t *rdp, uint32_t msg)
 {
-    connection_t *connection = NULL;
-    int result = RDP_CONNECT_INVALID_ARGUMENT;
+    int32_t char_sent;
+    struct sockaddr_in loop;
 
-    if ((options & ~RDP_CONNECTION_FEATURE_KEEPALIVE) == 0)
+    char_sent = (int32_t)sizeof(msg);
+    if (rdp->udp_socket == -1)
     {
-        connection = (connection_t *)rdplib_platform_malloc(sizeof(*connection));
-        result = RDP_CONNECT_ALLOCATION_FAILED;
-        if (connection)
+        if (rdp->ipx_socket != -1)
         {
-            connection_init(connection, owner, endpoint, options);
-            result = connection_create(connection);
-            if (result == 0)
-            {
-                rdplib_platform_mutex_lock(&owner->events.lock);
-                (void)pqueue_insert(&owner->events.queue, &connection->event_link);
-                connhash_insert(&owner->connections, connection);
-                rdplib_platform_mutex_unlock(&owner->events.lock);
-
-                (void)connhash_lock(&owner->connections, connection->transmit.remote_address);
-                *output = connection;
-            }
-        }
-    }
-
-    if (result != 0 && connection)
-    {
-        connection_destroy(connection);
-        rdplib_platform_free(connection);
-    }
-
-    return result;
-}
-
-int rdp_connect(rdp_t *owner, connection_t **output, const char *host, uint16_t port, uint32_t options)
-{
-    connection_t *connection;
-    uint8_t endpoint[16];
-    int result;
-
-    if (rdplib_platform_resolve_ipv4(host, port, endpoint) != 0)
-    {
-        return RDP_CONNECT_RESOLVE_FAILED;
-    }
-
-    ++g_rdp_stat->outgoing_connection_attempts;
-    result = rdp_connection_create_internal(owner, &connection, endpoint, options);
-    if (result == 0)
-    {
-        connection->locally_initiated = 1;
-        rdp_unlock(connection);
-        *output = connection;
-    }
-    return result;
-}
-
-void rdp_enqueue_arrival(rdp_application_receive_t *receive, msg_arrival_t *message)
-{
-    void *previous_head;
-
-    if (message->sender_connection && ((connection_t *)message->sender_connection)->linger_active)
-    {
-        fast_free(message);
-        return;
-    }
-
-    msg_arrival_prepare_for_rxq(message);
-    rdplib_platform_mutex_lock(&receive->producer_lock);
-
-    previous_head = receive->producer_queue.messages.head ? receive->producer_queue.messages.head->value : NULL;
-    message->_f0028 = 0;
-    list_add_tail(&receive->producer_queue.messages, &message->link);
-    if (!previous_head)
-    {
-        // The clients signal under the producer lock and only for the empty to nonempty transition.
-        rdplib_platform_semaphore_signal(&receive->arrival_semaphore);
-    }
-
-    rdplib_platform_mutex_unlock(&receive->producer_lock);
-}
-
-void rdp_handle_connectionless(rdp_t *owner, const uint8_t *payload, uint32_t payload_bytes, const uint8_t source[16])
-{
-    msg_arrival_t *message = (msg_arrival_t *)fast_malloc((uint32_t)sizeof(*message) + payload_bytes);
-
-    // The clients initialize this unchecked allocation immediately.
-    memset(message, 0, sizeof(*message));
-    msg_arrival_init(message, 0);
-    message->flags = UINT16_C(0xFFFF);
-    message->payload_bytes = payload_bytes;
-    memcpy(msg_arrival_get_data(message), payload, payload_bytes);
-    memcpy(message->sender_address, source, sizeof(message->sender_address));
-    rdp_enqueue_arrival(&owner->application_receive, message);
-}
-
-void rdp_handle_complete_arrival(rdp_t *owner, connection_t *connection, msg_arrival_t *message)
-{
-    rdp_receive_ownership_state_t *ownership = &connection->receive.ownership;
-
-    if (message->flags & RDP_FLAG_FIN)
-    {
-        rx_save_fin_arrival(connection, message);
-    }
-    else if (message->flags & RDP_FLAG_SEQUENCED)
-    {
-        if (message->flags & RDP_FLAG_MSGID)
-        {
-            uint8_t stream_id = message->stream_id;
-            msg_arrival_t *next;
-
-            rx_sort_into_sequence(connection, message);
-            while ((next = rx_get_next_in_sequence(connection, stream_id)) != NULL)
-            {
-                rdp_enqueue_arrival(&owner->application_receive, next);
-            }
-        }
-        else if (rx_in_sequence(connection, message))
-        {
-            rdp_enqueue_arrival(&owner->application_receive, message);
-        }
-        else
-        {
-            fast_free(message);
+            char_sent = rdplib_platform_send_datagram_to(rdp->ipx_socket, (const uint8_t *)&msg, sizeof(msg), &rdp->local_ipx_addr, sizeof(rdp->local_ipx_addr));
         }
     }
     else
     {
-        rdp_enqueue_arrival(&owner->application_receive, message);
+        memcpy(&loop, &rdp->local_udp_addr, sizeof(loop));
+        loop.sin_addr.s_addr = htonl(UINT32_C(0x7F000001));
+        char_sent = rdplib_platform_send_datagram_to(rdp->udp_socket, (const uint8_t *)&msg, sizeof(msg), &loop, sizeof(loop));
     }
+    return char_sent != (int32_t)sizeof(msg);
+}
 
-    if (ownership->fin_arrival_pending && connection->receive.ack.received_through_message_id == ownership->fin_message_id && ownership->saved_fin_arrival)
+void rdp_resort(connection_t *c, uint32_t wakeup_iothread)
+{
+    rdp_t *rdp;
+    struct _timeout_data next_event;
+
+    rdp = c->cn_rdp;
+#ifdef RDPLIB_DEBUG
+    assert(umutex_owner( &c->cn_lock ));
+#endif
+    connection_recalc_event_timeout(c, &next_event);
+    eventq_lock(&rdp->conn_eventq);
+    if (memcmp(&c->cn_event_time, &next_event, sizeof(next_event)) != 0)
     {
-        rdp_enqueue_arrival(&owner->application_receive, rx_load_fin_arrival(connection));
+        c->cn_event_time = next_event;
+        eventq_resort_by_ptr(&rdp->conn_eventq, c);
+        if (c == eventq_peek_head(&rdp->conn_eventq) && !rdp->wake_sent && wakeup_iothread)
+        {
+            (void)rdp_wake(rdp, 0);
+            rdp->wake_sent = 1;
+        }
+    }
+    eventq_unlock(&rdp->conn_eventq);
+}
+
+void rdp_unlock(connection_t *c)
+{
+    rdp_t *rdp;
+
+    rdp = c->cn_rdp;
+    c = connhash_unlock(&rdp->addr_map, c);
+    if (c)
+    {
+        eventq_lock(&rdp->conn_eventq);
+        (void)eventq_remove_by_ptr(&rdp->conn_eventq, c);
+        eventq_unlock(&rdp->conn_eventq);
+#ifdef RDPLIB_DEBUG
+        dpf(0x2000u, "[0x%08x] deleted (unlock)\n", (uint32_t)(uintptr_t)c);
+#endif
+        connection_destroy(c);
+        rdplib_platform_free(c);
     }
 }
 
-uint32_t rdp_handle_data_recv(rdp_t *owner, uint8_t *packet, int32_t packet_bytes, const uint8_t source_address[16])
+#ifdef RDP_DEAD_CODE
+// unused, retained for historical interest
+void rdp_set_socket_rcvbuf(rdp_t *rdp, int size)
 {
-    connection_t *connection = NULL;
-    _rdp_header_t header;
+    int result;
+
+    result = rdplib_platform_socket_set_option(rdp->udp_socket, RDP_SOCKET_LEVEL, RDP_SOCKET_RECEIVE_BUFFER, &size, sizeof(size));
+#ifdef RDPLIB_DEBUG
+    assert(result != -1);
+#endif
+}
+
+void rdp_set_socket_sndbuf(rdp_t *rdp, int size)
+{
+    int result;
+
+    result = rdplib_platform_socket_set_option(rdp->udp_socket, RDP_SOCKET_LEVEL, RDP_SOCKET_SEND_BUFFER, &size, sizeof(size));
+#ifdef RDPLIB_DEBUG
+    assert(result != -1);
+#endif
+}
+
+int rdp_get_socket_sndbuf(rdp_t *rdp)
+{
+    uint32_t optlen;
+    int size;
+    int result;
+
+    optlen = sizeof(size);
+    result = rdplib_platform_socket_get_option(rdp->udp_socket, RDP_SOCKET_LEVEL, RDP_SOCKET_SEND_BUFFER, &size, &optlen);
+#ifdef RDPLIB_DEBUG
+    assert(result != -1);
+#endif
+    return size;
+}
+#endif
+
+void rdp_enqueue_arrival(rdp_t *rdp, msg_arrival_t *arrival)
+{
+#ifdef RDPLIB_DEBUG
+    assert(( arrival->sender == NULL ) || ( arrival->sender->cn_rdp == rdp ));
+#endif
+    if (arrival->sender && arrival->sender->cn_closed)
+    {
+#ifdef RDPLIB_DEBUG
+        dpf(0x2000u, "[0x%08x] discarded message that arrived after close\n", (uint32_t)(uintptr_t)arrival->sender);
+#endif
+        fast_free(arrival);
+    }
+    else
+    {
+        msg_arrival_t *queue_head;
+
+        msg_arrival_prepare_for_rxq(arrival);
+        umutex_lock(&rdp->message_rxq_mutex);
+        queue_head = rxq_peek_head(&rdp->message_rxq);
+#ifdef RDPLIB_DEBUG
+        arrival->enqueue_time = time_get_ms();
+#elif defined(RDPLIB_SOURCE_FAITHFUL)
+        arrival->enqueue_time = 0;
+#endif
+        rxq_add_tail(&rdp->message_rxq, arrival);
+        if (!queue_head)
+        {
+            usemaphore_increment(&rdp->receive_semaphore);
+        }
+        umutex_unlock(&rdp->message_rxq_mutex);
+    }
+}
+
+void rdp_handle_complete_arrival(rdp_t *rdp, connection_t *c, msg_arrival_t *arrival)
+{
+    uint8_t stream;
+    uint32_t in_order;
+
+#ifdef RDPLIB_DEBUG
+    assert(rdp == c->cn_rdp);
+    assert(c == arrival->sender);
+#endif
+    if (arrival->options & RDP_FLAG_FIN)
+    {
+        rx_save_fin_arrival(c, arrival);
+    }
+    else if (arrival->options & RDP_FLAG_SEQUENCED)
+    {
+        if (arrival->options & RDP_FLAG_MSGID)
+        {
+            stream = arrival->stream;
+#ifdef RDPLIB_DEBUG
+            assert(stream < STREAMS_PER_CONNECTION);
+#endif
+            rx_sort_into_sequence(c, arrival);
+            while ((arrival = rx_get_next_in_sequence(c, stream)) != NULL)
+            {
+                rdp_enqueue_arrival(rdp, arrival);
+            }
+        }
+        else
+        {
+            in_order = rx_in_sequence(c, arrival);
+            if (in_order)
+            {
+                rdp_enqueue_arrival(rdp, arrival);
+            }
+            else
+            {
+                fast_free(arrival);
+            }
+        }
+    }
+    else
+    {
+        rdp_enqueue_arrival(rdp, arrival);
+    }
+
+    if (rx_rcvd_all_msgids(c) && rx_fin_waiting(c))
+    {
+        arrival = rx_load_fin_arrival(c);
+        rdp_enqueue_arrival(rdp, arrival);
+    }
+}
+
+void rdp_handle_connectionless(rdp_t *rdp, const char *data, uint32_t size, struct sockaddr *remote_addr)
+{
     msg_arrival_t *arrival;
-    rdp_rx_arrival_disposition_t disposition;
-    uint32_t duplicate_reliable = 1;
-    uint32_t expected_crc;
-    uint32_t network_crc;
-    uint32_t wake_token;
-    uint16_t network_flags;
-    uint16_t source_family;
-    uint16_t flags;
 
-    if (packet_bytes < 2)
+    arrival = (msg_arrival_t *)fast_malloc((uint32_t)sizeof(*arrival) + size);
+    memset(arrival, 0, sizeof(*arrival));
+    msg_arrival_init(arrival, 0);
+    arrival->size = size;
+    arrival->options = UINT16_C(0xFFFF);
+    memcpy(msg_arrival_get_data(arrival), data, size);
+    memcpy(&arrival->from, remote_addr, sizeof(arrival->from));
+    rdp_enqueue_arrival(rdp, arrival);
+}
+
+int32_t rdp_verify_crc(char *buffer, int32_t buffer_size)
+{
+    uint32_t crc;
+
+    if (buffer_size < 6)
     {
         return 0;
     }
-
-    memcpy(&source_family, source_address, sizeof(source_family));
-    if ((source_family == RDP_TRANSMIT_ADDRESS_IPV4 && memcmp(source_address + 2, owner->ipv4_address + 2, 2) == 0 && source_address[4] == 127 && source_address[5] == 0 && source_address[6] == 0 &&
-         source_address[7] == 1) ||
-        memcmp(source_address, owner->ipx_address, 16) == 0)
-    {
-        if (packet_bytes == sizeof(wake_token))
-        {
-            memcpy(&wake_token, packet, sizeof(wake_token));
-            return wake_token;
-        }
-
-        ++g_rdp_stat->invalid_local_wakeup_datagrams;
-        return 0;
-    }
-
-    owner->input_bytes += packet_bytes + 28u;
-    if (owner->use_encryption)
-    {
-        if (packet_bytes != 0 && (packet_bytes & 7u) == 0)
-        {
-            uint8_t padding_bytes;
-
-            rdp_decode(packet, (int)(packet_bytes / 8u));
-            padding_bytes = packet[packet_bytes - 1u] & 0x0Fu;
-            packet_bytes = padding_bytes <= 8u ? packet_bytes - padding_bytes : 0;
-        }
-        else
-        {
-            ++g_rdp_stat->invalid_encrypted_datagram_sizes;
-        }
-    }
-
-    memcpy(&network_flags, packet, sizeof(network_flags));
-    if ((owner->use_crc || owner->use_encryption) && packet_bytes >= 6 && ntohs(network_flags) != UINT16_C(0xFFFF))
-    {
-        packet_bytes -= 4u;
-        memcpy(&network_crc, packet + packet_bytes, sizeof(network_crc));
-        expected_crc = ntohl(network_crc);
-        if (packet_bytes == 0 || expected_crc != rdp_crc(0, packet, packet_bytes))
-        {
-            ++g_rdp_stat->illegal_framed_datagrams;
-            return 0;
-        }
-    }
-
-    if (packet_bytes < 2)
+    buffer_size -= 4;
+    memcpy(&crc, buffer + buffer_size, sizeof(crc));
+    crc = ntohl(crc);
+    if (crc != rdp_crc(0, buffer, (uint32_t)buffer_size))
     {
         return 0;
     }
+    return buffer_size;
+}
 
-    memcpy(&network_flags, packet, sizeof(network_flags));
-    flags = ntohs(network_flags);
-    if (flags == UINT16_C(0xFFFF))
-    {
-        rdp_handle_connectionless(owner, packet + 2, packet_bytes - 2u, source_address);
-        return 0;
-    }
+int32_t rdp_decode_data(char *scratch, int32_t char_recv)
+{
+    uint8_t pad_size;
 
-    connection = connhash_lock(&owner->connections, source_address);
-    if (!connection)
+    rdp_decode(scratch, char_recv / 8);
+    pad_size = (uint8_t)scratch[char_recv - 1] & UINT8_C(0x0F);
+    if (pad_size <= 8u)
     {
-        if ((flags & RDP_FLAG_SYN) != 0)
-        {
-            (void)rdp_connection_create_internal(owner, &connection, source_address, 0);
-            ++g_rdp_stat->incoming_connection_attempts;
-        }
-        else
-        {
-            ++g_rdp_stat->unknown_endpoint_datagrams;
-        }
+        return char_recv - pad_size;
     }
-
-    if (!connection || connection->reserved_receive_gate)
-    {
-        // A nonzero reserved gate leaks the locked temporary reference in all
-        // 3 game clients. No transport writer for the field was found.
-        return 0;
-    }
-
-#ifndef RDPLIB_SOURCE_FAITHFUL
-    if (connection->rdplib_packet_drop_callback &&
-        connection->rdplib_packet_drop_callback(connection->rdplib_packet_drop_context, RDPLIB_PACKET_DROP_INBOUND, packet, (uint32_t)packet_bytes))
-    {
-        rdp_unlock(connection);
-        return 0;
-    }
-#endif
-
-    disposition = connection_parse_and_validate_arrival(connection, packet, (uint16_t)packet_bytes, &header);
-#ifdef RDPLIB_SOURCE_FAITHFUL
-    (void)rdplib_platform_current_time_ms();
-#endif
-    if (disposition != RDP_RX_ACCEPT)
-    {
-        if ((header.flags & RDP_FLAG_SYN) != 0)
-        {
-            ++g_rdp_stat->rejected_incoming_syn_datagrams;
-        }
-    }
-    else
-    {
-        connection_record_arrival(connection, &header, &duplicate_reliable);
-        if (duplicate_reliable)
-        {
-            owner->duplicate_input_bytes += packet_bytes + 28u;
-        }
-    }
-
-    if (!connection->transmit.connected && !connection->transmit.disconnect_message_queued)
-    {
-        arrival = (msg_arrival_t *)fast_malloc((uint32_t)sizeof(*arrival));
-        msg_arrival_init_disconnect_msg(arrival, connection);
-        rdp_enqueue_arrival(&owner->application_receive, arrival);
-        connection->transmit.disconnect_message_queued = 1;
-    }
-    rdp_resort(connection, 0);
-
-    if (connection->transmit.connected)
-    {
-        if (connection->linger_active)
-        {
-            ++g_rdp_stat->application_arrivals_discarded_during_linger;
-        }
-        else if ((header.flags & RDP_FLAG_SYSTEM) == 0 && !duplicate_reliable && disposition == RDP_RX_ACCEPT && (header.payload_bytes != 0 || (header.flags & RDP_FLAG_FIN) != 0))
-        {
-            arrival = rx_assemble(connection, &header, packet + header.header_bytes);
-            if (arrival)
-            {
-                rdp_handle_complete_arrival(owner, connection, arrival);
-            }
-        }
-    }
-    else
-    {
-        ++g_rdp_stat->application_arrivals_discarded_after_disconnect;
-    }
-
-    rdp_unlock(connection);
     return 0;
 }
 
-void rdp_handle_reported_icmp(rdp_t *owner, const uint8_t remote_address[16], uint8_t type, uint8_t code, uint8_t trace_response, uint8_t trace_sample,
-                              const uint8_t source_address[16])
+uint32_t rdp_handle_data_recv(rdp_t *rdp, char *scratch, int32_t char_recv, struct sockaddr *remote_addr)
 {
-    connection_t *connection;
-    msg_arrival_t *arrival;
+    uint32_t quit;
+    uint32_t duplicate;
+    rdp_header_t rdp_header;
+    connection_t *c;
+    uint16_t options;
+    rdp_rx_arrival_disposition_t validation;
+    msg_arrival_t *complete;
+    uint16_t remote_family;
 
-    connection = connhash_lock(&owner->connections, remote_address);
-    if (!connection)
+    quit = 0;
+    if (char_recv < 2)
     {
-        return;
+        return quit;
+    }
+
+#ifdef RDPLIB_SOURCE_FAITHFUL
+    remote_family = (uint16_t)remote_addr->sa_family;
+    if ((remote_family == RDP_TRANSMIT_ADDRESS_IPV4 && *(uint16_t *)remote_addr->sa_data == rdp->local_udp_addr.sin_port &&
+         *(uint32_t *)&remote_addr->sa_data[2] == htonl(UINT32_C(0x7F000001))) ||
+        memcmp(remote_addr, &rdp->local_ipx_addr, sizeof(struct sockaddr)) == 0)
+#else
+    memcpy(&remote_family, remote_addr, sizeof(remote_family));
+    if ((remote_family == RDP_TRANSMIT_ADDRESS_IPV4 && memcmp(remote_addr->sa_data, &rdp->local_udp_addr.sin_port, 2) == 0 &&
+         memcmp(&remote_addr->sa_data[2], "\x7f\x00\x00\x01", 4) == 0) ||
+        (remote_family == RDP_TRANSMIT_ADDRESS_IPX && memcmp(remote_addr, &rdp->local_ipx_addr, sizeof(rdp->local_ipx_addr)) == 0))
+#endif
+    {
+        if (char_recv == (int32_t)sizeof(quit))
+        {
+            memcpy(&quit, scratch, sizeof(quit));
+        }
+        else
+        {
+            ++g_rdp_stat->discarded_invalid_localhost;
+        }
+        return quit;
+    }
+
+    c = NULL;
+    duplicate = 1;
+    rdp->bytes_recvd += (uint32_t)char_recv + 28u;
+    if (rdp->encrypt)
+    {
+        if (char_recv != 0 && (char_recv & 7) == 0)
+        {
+            char_recv = rdp_decode_data(scratch, char_recv);
+        }
+        else
+        {
+#ifdef RDPLIB_SOURCE_FAITHFUL
+            char addr[64];
+            format_sockaddr(addr, remote_addr);
+            discard_log_append("%s invalid size (%u)\n", addr, (uint32_t)char_recv);
+#endif
+            ++g_rdp_stat->discarded_bad_size;
+        }
+    }
+
+    if ((rdp->crc || rdp->encrypt) && char_recv >= 6)
+    {
+#ifdef RDPLIB_SOURCE_FAITHFUL
+        options = ntohs(*(uint16_t *)scratch);
+#else
+        options = rdplib_load_network_u16((const uint8_t *)scratch);
+#endif
+        if (options != UINT16_C(0xFFFF))
+        {
+            char_recv = rdp_verify_crc(scratch, char_recv);
+            if (!char_recv)
+            {
+#ifdef RDPLIB_SOURCE_FAITHFUL
+                char addr[64];
+                format_sockaddr(addr, remote_addr);
+                discard_log_append("%s illegal message\n", addr);
+#endif
+                ++g_rdp_stat->discarded_bad_crc;
+                return quit;
+            }
+        }
+    }
+
+    if (char_recv < 2)
+    {
+        return quit;
+    }
+#ifdef RDPLIB_SOURCE_FAITHFUL
+    options = ntohs(*(uint16_t *)scratch);
+#else
+    options = rdplib_load_network_u16((const uint8_t *)scratch);
+#endif
+    if (options == UINT16_C(0xFFFF))
+    {
+        rdp_handle_connectionless(rdp, scratch + 2, (uint32_t)char_recv - 2u, remote_addr);
+        return quit;
+    }
+
+    c = rdp_lock_addr(rdp, remote_addr);
+    if (!c)
+    {
+        if (options & RDP_FLAG_SYN)
+        {
+            uint32_t result;
+
+            result = rdp_connection_create_internal(rdp, &c, remote_addr, 0);
+#ifdef RDPLIB_DEBUG
+            assert(result == URESULT_OK);
+            assert(umutex_owner( &c->cn_lock ));
+#endif
+            (void)result;
+            ++g_rdp_stat->connection_accepts;
+        }
+        else
+        {
+#ifdef RDPLIB_DEBUG
+            dpf(0x4000u, "ignoring packet received without connection or SYN\n");
+#endif
+            ++g_rdp_stat->packets_without_connection;
+        }
+    }
+
+    if (!c || c->cn_abort)
+    {
+        return quit;
     }
 
 #ifndef RDPLIB_SOURCE_FAITHFUL
-    // Multiple errors can already be queued for retransmissions to the
-    // same peer. Do not publish the same disconnect more than once.
-    if (!trace_response && !connection->transmit.connected && connection->transmit.disconnect_message_queued)
+    if (c->rdplib_packet_drop_callback && c->rdplib_packet_drop_callback(c->rdplib_packet_drop_context, RDPLIB_PACKET_DROP_INBOUND, (const uint8_t *)scratch, (uint32_t)char_recv))
     {
-        rdp_unlock(connection);
-        return;
+        rdp_unlock(c);
+        return quit;
     }
 #endif
 
-    connection_handle_icmp(connection, type, code, trace_response, trace_sample, source_address);
-    if (!connection->transmit.connected && !connection->transmit.disconnect_message_queued)
+#ifdef RDPLIB_DEBUG
+    assert(umutex_owner( &c->cn_lock ));
+#endif
+    validation = (rdp_rx_arrival_disposition_t)connection_parse_and_validate_arrival(c, (uint16_t *)(void *)scratch, (uint16_t)char_recv, &rdp_header);
+#ifdef RDPLIB_SOURCE_FAITHFUL
+    (void)time_get_ms();
+#endif
+#ifdef RDPLIB_DEBUG
+    dpf(0x40000u, "recvfrom TIME: %4u SEQNUM: %4u SIZE: %4u\n", time_get_ms(), rdp_header.seqnum, (uint32_t)char_recv);
+#endif
+    if (validation != RDP_RX_ACCEPT)
     {
-        arrival = (msg_arrival_t *)fast_malloc((uint32_t)sizeof(*arrival));
-        msg_arrival_init_disconnect_msg(arrival, connection);
-        rdp_enqueue_arrival(&owner->application_receive, arrival);
-        connection->transmit.disconnect_message_queued = 1;
+#ifdef RDPLIB_DEBUG
+        dpf(0x4000u, "ignoring packet that failed validation\n");
+#endif
+#ifdef RDPLIB_SOURCE_FAITHFUL
+        if (rdp_header.options & RDP_FLAG_SYN)
+#else
+        if (options & RDP_FLAG_SYN)
+#endif
+        {
+            ++g_rdp_stat->bad_connection_attempts;
+        }
     }
-    rdp_resort(connection, 0);
-    rdp_unlock(connection);
+    else
+    {
+        connection_record_arrival(c, &rdp_header, &duplicate);
+        if (duplicate)
+        {
+            rdp->duplicate_bytes_recvd += (uint32_t)char_recv + 28u;
+        }
+    }
+
+    if (tx_needs_disconnect_msg(c))
+    {
+        rdp_enqueue_disconnect_msg(rdp, c);
+    }
+    rdp_resort(c, 0);
+    if (c->tx_connected)
+    {
+        if (c->cn_closed)
+        {
+            ++g_rdp_stat->packets_received_after_close;
+        }
+#ifdef RDPLIB_SOURCE_FAITHFUL
+        else if (!(rdp_header.options & RDP_FLAG_SYSTEM) && !duplicate && validation == RDP_RX_ACCEPT &&
+                 (rdp_header.data_size || (rdp_header.options & RDP_FLAG_FIN)))
+#else
+        else if (validation == RDP_RX_ACCEPT && !(rdp_header.options & RDP_FLAG_SYSTEM) && !duplicate &&
+                 (rdp_header.data_size || (rdp_header.options & RDP_FLAG_FIN)))
+#endif
+        {
+            complete = rx_assemble(c, &rdp_header, scratch + rdp_header.header_size);
+            if (complete)
+            {
+                rdp_handle_complete_arrival(rdp, c, complete);
+            }
+        }
+    }
+    else
+    {
+        ++g_rdp_stat->packets_received_after_disconnect;
+    }
+    rdp_unlock(c);
+    return quit;
 }
 
-void rdp_handle_icmp_recv(rdp_t *owner, const uint8_t *packet, uint32_t packet_bytes, const uint8_t source_address[16])
+void rdp_handle_icmp_recv(rdp_t *rdp, char *scratch, int32_t char_recv, struct sockaddr_in *remote_addr)
 {
-    const uint8_t *quoted_ipv4;
-    const uint8_t *quoted_udp;
-    const uint8_t *icmp;
-    uint8_t remote_address[16] = {0};
-    uint32_t outer_header_bytes;
-    uint32_t quoted_header_bytes;
+#ifdef RDPLIB_DEBUG
+    char src_addr[20];
+    uint32_t dpf_mask;
+#endif
+    uint16_t rejected_ip_header_len;
+    uint8_t index;
+#ifdef RDPLIB_DEBUG
+    char gateway[20];
+#endif
+    uint8_t *icmp_header;
+    uint16_t ip_header_len;
+    uint8_t *rejected_ip_header;
+    uint8_t *rejected_udp_header;
+#ifdef RDPLIB_DEBUG
+    char dst_addr[20];
+#endif
+    uint8_t *ip_header;
+    connection_t *c;
+    struct sockaddr_in sin;
     uint32_t sum;
-    uint16_t address_family;
-    uint16_t network_word;
     uint16_t remote_port;
+    uint16_t network_word;
     uint8_t trace_response;
-    uint8_t trace_sample = 0;
 
-    if (packet_bytes == UINT32_MAX)
+    c = NULL;
+    if (char_recv == -1)
+    {
+        return;
+    }
+    rdp->bytes_recvd += (uint32_t)char_recv + 28u;
+    if (char_recv < 28)
     {
         return;
     }
 
-    owner->input_bytes += packet_bytes + 28u;
-    if (packet_bytes < 28u)
+    ip_header = (uint8_t *)scratch;
+    ip_header_len = (uint16_t)(4u * (ip_header[0] & 0x0Fu));
+    if ((uint32_t)char_recv < (uint32_t)ip_header_len + 8u)
+    {
+        return;
+    }
+    icmp_header = ip_header + ip_header_len;
+    if ((icmp_header[0] != 3 && icmp_header[0] != 4 && icmp_header[0] != 11) || (uint32_t)char_recv < (uint32_t)ip_header_len + 28u)
     {
         return;
     }
 
-    outer_header_bytes = (packet[0] & 0x0Fu) * 4u;
-    if (packet_bytes < outer_header_bytes + 8u)
+    rejected_ip_header = icmp_header + 8;
+    rejected_ip_header_len = (uint16_t)(4u * (rejected_ip_header[0] & 0x0Fu));
+    if ((uint32_t)char_recv < (uint32_t)ip_header_len + rejected_ip_header_len + 16u || rejected_ip_header[9] != 17)
+    {
+        return;
+    }
+    rejected_udp_header = rejected_ip_header + rejected_ip_header_len;
+    if (memcmp(rejected_udp_header, &rdp->local_udp_addr.sin_port, 2) != 0 && memcmp(rejected_udp_header, &rdp->trace_local_addr.sin_port, 2) != 0)
     {
         return;
     }
 
-    icmp = packet + outer_header_bytes;
-    if ((icmp[0] != 3 && icmp[0] != 4 && icmp[0] != 11) || packet_bytes < outer_header_bytes + 28u)
+#ifdef RDPLIB_DEBUG
+    dpf_mask = UINT32_C(0x800000);
+#endif
+    trace_response = (uint8_t)(memcmp(rejected_udp_header, &rdp->trace_local_addr.sin_port, 2) == 0);
+    if (trace_response)
     {
-        return;
+#ifdef RDPLIB_DEBUG
+        dpf_mask |= UINT32_C(0x10000000);
+#endif
     }
 
-    quoted_ipv4 = icmp + 8;
-    quoted_header_bytes = (quoted_ipv4[0] & 0x0Fu) * 4u;
-    if (packet_bytes < outer_header_bytes + quoted_header_bytes + 16u || quoted_ipv4[9] != 17)
-    {
-        return;
-    }
+#ifdef RDPLIB_DEBUG
+    sprintf(gateway, "%u.%u.%u.%u", (uint32_t)((const uint8_t *)&remote_addr->sin_addr)[0], (uint32_t)((const uint8_t *)&remote_addr->sin_addr)[1],
+            (uint32_t)((const uint8_t *)&remote_addr->sin_addr)[2], (uint32_t)((const uint8_t *)&remote_addr->sin_addr)[3]);
+    sprintf(src_addr, "%u.%u.%u.%u", (uint32_t)rejected_ip_header[12], (uint32_t)rejected_ip_header[13], (uint32_t)rejected_ip_header[14], (uint32_t)rejected_ip_header[15]);
+    sprintf(dst_addr, "%u.%u.%u.%u", (uint32_t)rejected_ip_header[16], (uint32_t)rejected_ip_header[17], (uint32_t)rejected_ip_header[18], (uint32_t)rejected_ip_header[19]);
+    dpf(dpf_mask, "ICMP from: %s for UDP: %s:%u->%s:%u ", gateway, src_addr, ntohs(rdplib_rdp_load_native_u16(rejected_udp_header)), dst_addr,
+        ntohs(rdplib_rdp_load_native_u16(rejected_udp_header + 2)));
+#endif
 
-    quoted_udp = quoted_ipv4 + quoted_header_bytes;
-    if (memcmp(quoted_udp, owner->ipv4_address + 2, 2) != 0 && memcmp(quoted_udp, owner->probe_address + 2, 2) != 0)
-    {
-        return;
-    }
-
-    trace_response = (uint8_t)(memcmp(quoted_udp, owner->probe_address + 2, 2) == 0);
-    memcpy(&network_word, quoted_udp + 2, sizeof(network_word));
+    memcpy(&network_word, rejected_udp_header + 2, sizeof(network_word));
     remote_port = ntohs(network_word);
+    index = 0;
     if (trace_response)
     {
         sum = 0;
-        memcpy(&network_word, quoted_ipv4 + 12, sizeof(network_word));
-        sum += ntohs(network_word);
-        memcpy(&network_word, quoted_ipv4 + 14, sizeof(network_word));
-        sum += ntohs(network_word);
-        memcpy(&network_word, quoted_ipv4 + 16, sizeof(network_word));
-        sum += ntohs(network_word);
-        memcpy(&network_word, quoted_ipv4 + 18, sizeof(network_word));
-        sum += ntohs(network_word);
-        sum += quoted_ipv4[9];
-        memcpy(&network_word, quoted_udp + 4, sizeof(network_word));
-        sum += ntohs(network_word);
-        memcpy(&network_word, quoted_udp, sizeof(network_word));
-        sum += ntohs(network_word);
-        memcpy(&network_word, quoted_udp + 2, sizeof(network_word));
-        sum += ntohs(network_word);
-        memcpy(&network_word, quoted_udp + 4, sizeof(network_word));
-        sum += ntohs(network_word);
-        memcpy(&network_word, quoted_udp + 6, sizeof(network_word));
-        sum += ntohs(network_word);
+        memcpy(&network_word, rejected_ip_header + 12, 2);
+        sum += network_word;
+        memcpy(&network_word, rejected_ip_header + 14, 2);
+        sum += network_word;
+        memcpy(&network_word, rejected_ip_header + 16, 2);
+        sum += network_word;
+        memcpy(&network_word, rejected_ip_header + 18, 2);
+        sum += network_word;
+        sum += rejected_ip_header[9];
+        memcpy(&network_word, rejected_udp_header + 4, 2);
+        sum += network_word;
+        memcpy(&network_word, rejected_udp_header, 2);
+        sum += network_word;
+        memcpy(&network_word, rejected_udp_header + 2, 2);
+        sum += network_word;
+        memcpy(&network_word, rejected_udp_header + 4, 2);
+        sum += network_word;
+        memcpy(&network_word, rejected_udp_header + 6, 2);
+        sum += network_word;
         sum = (sum & UINT32_C(0xFFFF)) + (sum >> 16);
         sum += sum >> 16;
         sum = (sum & UINT32_C(0xFF)) + (sum >> 8);
         sum += sum >> 8;
-        trace_sample = (uint8_t)~sum;
+        index = (uint8_t)~sum;
         remote_port &= UINT16_C(0x7FFF);
+#ifdef RDPLIB_DEBUG
+        dpf(dpf_mask, "probe index: %u ", index);
+#endif
     }
 
-    address_family = RDP_TRANSMIT_ADDRESS_IPV4;
-    network_word = htons(remote_port);
-    memcpy(remote_address, &address_family, sizeof(address_family));
-    memcpy(remote_address + 2, &network_word, sizeof(network_word));
-    memcpy(remote_address + 4, quoted_ipv4 + 16, 4);
-    rdp_handle_reported_icmp(owner, remote_address, icmp[0], icmp[1], trace_response, trace_sample, source_address);
+    memset(&sin, 0, sizeof(sin));
+    sin.sin_family = RDP_TRANSMIT_ADDRESS_IPV4;
+    sin.sin_port = htons(remote_port);
+    memcpy(&sin.sin_addr, rejected_ip_header + 16, sizeof(sin.sin_addr));
+    c = rdp_lock_addr(rdp, (struct sockaddr *)&sin);
+#ifdef RDPLIB_DEBUG
+    dpf(dpf_mask, "(connection_t: 0x%08x) ", (uint32_t)(uintptr_t)c);
+
+    if (icmp_header[0] == 3)
+    {
+        switch (icmp_header[1])
+        {
+        case 0: dpf(dpf_mask, "net unreachable\n"); break;
+        case 1: dpf(dpf_mask, "host unreachable\n"); break;
+        case 2: dpf(dpf_mask, "protocol unreachable\n"); break;
+        case 3: dpf(dpf_mask, "port unreachable\n"); break;
+        case 4: dpf(dpf_mask, "needs fragmentation\n"); break;
+        case 5: dpf(dpf_mask, "source route failed\n"); break;
+        case 6: dpf(dpf_mask, "net unknown\n"); break;
+        case 7: dpf(dpf_mask, "host unknown\n"); break;
+        case 8: dpf(dpf_mask, "isolated\n"); break;
+        default: dpf(dpf_mask, "unreachable CODE: %u\n", icmp_header[1]); break;
+        }
+    }
+    else if (icmp_header[0] == 4)
+    {
+        dpf(dpf_mask | UINT32_C(0x40000000), "source quench\n");
+    }
+    else if (icmp_header[1])
+    {
+        dpf(dpf_mask, "time exceeded CODE: %u\n", icmp_header[1]);
+    }
+    else
+    {
+        dpf(dpf_mask, "time exceeded in transit\n");
+    }
+#endif
+
+    if (c)
+    {
+#ifdef RDPLIB_DEBUG
+        assert(umutex_owner( &c->cn_lock ));
+#endif
+        connection_handle_icmp(c, icmp_header[0], icmp_header[1], trace_response, index, remote_addr);
+        if (tx_needs_disconnect_msg(c))
+        {
+            rdp_enqueue_disconnect_msg(rdp, c);
+        }
+        rdp_resort(c, 0);
+        rdp_unlock(c);
+    }
 }
 
-uint32_t rdp_io_thread(rdp_t *owner)
+void rdp_serial_drain(rdp_t *rdp)
 {
-    uint8_t packet[536];
-    uint8_t source_address[16];
-    uint8_t remote_address[16];
-#if defined(_WIN32) && !defined(RDPLIB_SOURCE_FAITHFUL)
-    const uint8_t unknown_icmp_source[16] = {0};
+    int32_t char_recv;
+    struct sockaddr remote_addr;
+    char scratch[536];
+
+    do
+    {
+        char_recv = serial_recv_from(&rdp->serial, scratch, sizeof(scratch), (sockaddr_com *)&remote_addr);
+        (void)rdp_handle_data_recv(rdp, scratch, char_recv, &remote_addr);
+    } while (char_recv != -1);
+    serial_set_time_next_recv(&rdp->serial, time_get_ms() + 100u);
+}
+
+#ifdef RDP_DEAD_CODE
+// unused, retained for historical interest
+uint32_t rdp_attach(rdp_t *rdp, int32_t file)
+{
+    uint32_t ok;
+    uint32_t result;
+
+    result = 0;
+#ifdef RDPLIB_DEBUG
+    assert(rdp->serial.file == INVALID_HANDLE_VALUE);
 #endif
-    rdp_timeval_t event_timeout_storage;
-    rdp_timeval_t serial_timeout_storage;
-    rdp_timeval_t *wait_timeout;
-    connection_t *connection;
-    msg_arrival_t *arrival;
-    rdp_timeout_data_t next_timeout;
+    if ((intptr_t)rdp->serial.file != -1)
+    {
+        return 9;
+    }
+#ifdef _WIN32
+    {
+        COMMTIMEOUTS ctmo;
+
+        memset(&ctmo, 0, sizeof(ctmo));
+        ctmo.ReadIntervalTimeout = UINT32_MAX;
+        ok = SetCommTimeouts((HANDLE)(intptr_t)file, &ctmo) != 0;
+    }
+#else
+    ok = 1;
+#endif
+    if (!ok)
+    {
+        return 1;
+    }
+    rdp->serial.file = (void *)(intptr_t)file;
+    (void)rdp_wake(rdp, 0);
+    rdp->wake_sent = 1;
+    return result;
+}
+#endif
+
+void rdp_destroy_internal(rdp_t *rdp)
+{
+    msg_arrival_t *msg;
+    connection_t *c;
+
+    while ((c = eventq_remove_head(&rdp->conn_eventq)) != NULL)
+    {
+        c = connhash_subref(&rdp->addr_map, c);
+#ifdef RDPLIB_DEBUG
+        dpf(0x20u, "rdp_shutdown: connection leaked %#08x\n", (uint32_t)(uintptr_t)c);
+#endif
+        connection_destroy(c);
+        rdplib_platform_free(c);
+    }
+    while ((msg = rxq_remove_head(&rdp->message_rxq)) != NULL)
+    {
+#ifdef RDPLIB_DEBUG
+        dpf(0x20u, "rdp_shutdown: message leaked %#08x\n", (uint32_t)(uintptr_t)msg);
+#endif
+        fast_free(msg);
+    }
+    while ((msg = rxq_remove_head(&rdp->external_rxq)) != NULL)
+    {
+#ifdef RDPLIB_DEBUG
+        dpf(0x20u, "rdp_shutdown: message leaked %#08x\n", (uint32_t)(uintptr_t)msg);
+#endif
+        fast_free(msg);
+    }
+
+    if (rdp->udp_socket != -1)
+    {
+        rdplib_platform_socket_close(rdp->udp_socket);
+    }
+    rdp->udp_socket = -1;
+    if (rdp->icmp_socket != -1)
+    {
+        rdplib_platform_socket_close(rdp->icmp_socket);
+    }
+    rdp->icmp_socket = -1;
+    if (rdp->trace_socket != -1)
+    {
+        rdplib_platform_socket_close(rdp->trace_socket);
+    }
+    rdp->trace_socket = -1;
+    if (rdp->ipx_socket != -1)
+    {
+        rdplib_platform_socket_close(rdp->ipx_socket);
+    }
+    rdp->ipx_socket = -1;
+    if (rdp->startup)
+    {
+        rdplib_platform_network_cleanup();
+        rdp->startup = 0;
+    }
+
+    serial_destroy(&rdp->serial);
+    connhash_destroy(&rdp->addr_map);
+    eventq_destroy(&rdp->conn_eventq);
+    usemaphore_destroy(&rdp->receive_semaphore);
+    rxq_destroy(&rdp->message_rxq);
+    umutex_destroy(&rdp->message_rxq_mutex);
+    rxq_destroy(&rdp->external_rxq);
+    umutex_destroy(&rdp->external_rxq_mutex);
+    if (!rdp->app_is_waiting_for_exit)
+    {
+        uthread_destroy(&rdp->io_thread);
+        rdplib_platform_free(rdp);
+    }
+}
+
+void rdp_io_thread(void *data)
+{
+    rdp_t *rdp;
+    struct timeval *tv;
+    struct timeval timeout_data;
+    uint32_t max_time;
+#ifdef RDPLIB_DEBUG
+    uint32_t loop_time;
+#endif
+    uint32_t current_time;
+    uint32_t timeout;
+    uint32_t elapsed_time;
+    connection_t *c;
+    int32_t ready;
+    int32_t max_timeout;
+    uint32_t event_processing_time;
+    int32_t char_recv;
+    struct sockaddr remote_addr;
+    char scratch[536];
     uint32_t enabled_sources;
     uint32_t ready_sources;
-    int32_t packet_bytes;
-    uint32_t wake_token;
-    uint32_t now_ms;
-    uint32_t elapsed_ms;
-    uint32_t last_event_pass_time_ms;
-    uint32_t serial_timeout_microseconds;
-    int32_t serial_time_remaining_ms;
-    int wait_result; // Intentionally uninitialized on the serial only sleep path, as in all 3 clients.
-
-    last_event_pass_time_ms = rdplib_platform_current_time_ms();
-#ifdef RDPLIB_SOURCE_FAITHFUL
-    (void)rdplib_platform_current_time_ms();
+    struct _timeout_data next_event;
+#if defined(_WIN32) && !defined(RDPLIB_SOURCE_FAITHFUL)
+    struct sockaddr_in unknown_icmp_source;
 #endif
-    while (owner->io_thread_running)
+
+    rdp = (rdp_t *)data;
+    tv = NULL;
+    max_time = time_get_ms();
+#ifdef RDPLIB_DEBUG
+    loop_time = time_get_ms();
+    (void)loop_time;
+#elif defined(RDPLIB_SOURCE_FAITHFUL)
+    (void)time_get_ms();
+#endif
+#ifdef RDPLIB_DEBUG
+    dpf(0x20u, "io_thread running\n");
+#endif
+
+    while (rdp->io_thread_running)
     {
-        enabled_sources = RDP_IO_SOURCE_NONE;
-        if (owner->ipv4_socket != -1)
+        enabled_sources = RDPLIB_PLATFORM_IO_SOURCE_NONE;
+        if (rdp->udp_socket != -1)
         {
-            enabled_sources |= RDP_IO_SOURCE_IPV4;
+            enabled_sources |= RDPLIB_PLATFORM_IO_SOURCE_IPV4;
         }
-        if (owner->ipx_socket != -1)
+        if (rdp->ipx_socket != -1)
         {
-            enabled_sources |= RDP_IO_SOURCE_LEGACY;
+            enabled_sources |= RDPLIB_PLATFORM_IO_SOURCE_IPX;
         }
-        if (owner->icmp_receive_socket != -1)
+        if (rdp->icmp_socket != -1)
         {
-            enabled_sources |= RDP_IO_SOURCE_ICMP;
+            enabled_sources |= RDPLIB_PLATFORM_IO_SOURCE_ICMP;
         }
         ready_sources = enabled_sources;
 
-        rdplib_platform_mutex_lock(&owner->events.lock);
-        wait_timeout = eventq_get_event_timeout(&owner->events, &event_timeout_storage);
-        owner->io_wakeup_pending = 0;
-        rdplib_platform_mutex_unlock(&owner->events.lock);
-
-        if (owner->serial.endpoint != -1)
+        eventq_lock(&rdp->conn_eventq);
+        tv = eventq_get_event_timeout(&rdp->conn_eventq, &timeout_data);
+        if (tv)
         {
-            serial_time_remaining_ms = (int32_t)(serial_get_time_next_recv(&owner->serial) - rdplib_platform_current_time_ms());
-            serial_timeout_microseconds = serial_time_remaining_ms > 0 ? 1000u * (uint32_t)serial_time_remaining_ms : 0;
-            if (!wait_timeout || wait_timeout->seconds != 0 || wait_timeout->microseconds > serial_timeout_microseconds)
+            timeout = 1000u * (uint32_t)tv->tv_sec + (uint32_t)tv->tv_usec / 1000u;
+        }
+        else
+        {
+            timeout = UINT32_MAX;
+        }
+        rdp->wake_sent = 0;
+        eventq_unlock(&rdp->conn_eventq);
+
+        if ((intptr_t)rdp->serial.file != -1)
+        {
+            max_timeout = (int32_t)(serial_get_time_next_recv(&rdp->serial) - time_get_ms());
+            max_timeout = max_timeout <= 0 ? 0 : 1000 * max_timeout;
+            if (!tv || tv->tv_usec > max_timeout || tv->tv_sec)
             {
-                serial_timeout_storage.seconds = 0;
-                serial_timeout_storage.microseconds = serial_timeout_microseconds;
-                wait_timeout = &serial_timeout_storage;
+                tv = &timeout_data;
+                timeout_data.tv_sec = 0;
+                timeout_data.tv_usec = max_timeout;
+                timeout = (uint32_t)max_timeout / 1000u;
             }
         }
 
-        if (owner->serial.endpoint != -1 && owner->ipx_socket == -1 && owner->ipv4_socket == -1)
+        if ((intptr_t)rdp->serial.file != -1 && rdp->ipx_socket == -1 && rdp->udp_socket == -1)
         {
-            rdplib_platform_sleep_ms(wait_timeout->microseconds / 1000u);
+            sleep_ms(timeout);
 #ifndef RDPLIB_SOURCE_FAITHFUL
-            wait_result = 0;
+            ready = 0;
 #endif
         }
-        else if (!wait_timeout || wait_timeout->seconds != 0 || wait_timeout->microseconds != 0)
+        else if (!tv || tv->tv_usec || tv->tv_sec)
         {
-            if (owner->ipx_socket == -1 && owner->ipv4_socket == -1)
+            if (rdp->ipx_socket == -1 && rdp->udp_socket == -1)
             {
-                rdplib_platform_sleep_ms(100);
-                wait_result = 0;
+                ready = 0;
+                sleep_ms(100);
             }
             else
             {
-                wait_result = rdplib_platform_wait(owner->ipv4_socket, owner->ipx_socket, owner->icmp_receive_socket, enabled_sources, wait_timeout == NULL, wait_timeout ? wait_timeout->seconds : 0,
-                                                   wait_timeout ? wait_timeout->microseconds : 0, &ready_sources);
+                ready = rdplib_platform_wait(rdp->udp_socket, rdp->ipx_socket, rdp->icmp_socket, enabled_sources, tv == NULL,
+                                             tv ? (uint32_t)tv->tv_sec : 0, tv ? (uint32_t)tv->tv_usec : 0, &ready_sources);
             }
         }
         else
         {
-            elapsed_ms = rdplib_platform_current_time_ms() - last_event_pass_time_ms;
-            if (elapsed_ms < 4)
+            event_processing_time = time_get_ms() - max_time;
+            if (event_processing_time < 4u)
             {
-                rdplib_platform_sleep_ms(4u - elapsed_ms);
+                timeout = 4u - event_processing_time;
+                sleep_ms(timeout);
             }
-            wait_result = 2;
+            ready = 2;
         }
 
-#ifdef RDPLIB_SOURCE_FAITHFUL
-        (void)rdplib_platform_current_time_ms();
+#ifdef RDPLIB_DEBUG
+        loop_time = time_get_ms();
+#elif defined(RDPLIB_SOURCE_FAITHFUL)
+        (void)time_get_ms();
 #endif
-        if (owner->serial.endpoint != -1 && (int32_t)(rdplib_platform_current_time_ms() - serial_get_time_next_recv(&owner->serial)) > 0)
+#ifdef RDPLIB_DEBUG
+        dpf(0x40u, "io_thread: select complete\n");
+#endif
+        if ((intptr_t)rdp->serial.file != -1 && (int32_t)(time_get_ms() - serial_get_time_next_recv(&rdp->serial)) > 0)
         {
-            do
-            {
-#ifdef _WIN32
-                packet_bytes = serial_recv_from_windows(&owner->serial, packet, sizeof(packet), source_address);
-#else
-                packet_bytes = serial_recv_from_mac(&owner->serial, packet, sizeof(packet), source_address);
-#endif
-                (void)rdp_handle_data_recv(owner, packet, packet_bytes, source_address);
-            } while (packet_bytes != -1);
-            serial_set_time_next_recv(&owner->serial, rdplib_platform_current_time_ms() + 100u);
+            rdp_serial_drain(rdp);
         }
 
-        if (wait_result <= 0)
+        if (ready <= 0)
         {
-            ++g_rdp_stat->io_wait_nonpositive_returns;
+            ++g_rdp_stat->retx_timeouts;
         }
         else
         {
-            if ((ready_sources & RDP_IO_SOURCE_IPV4) != 0 && owner->ipv4_socket != -1)
+            if ((ready_sources & RDPLIB_PLATFORM_IO_SOURCE_IPV4) != 0 && rdp->udp_socket != -1)
             {
 #if defined(__linux__) && !defined(RDPLIB_SOURCE_FAITHFUL)
-                if (owner->icmp_receive_socket == -1)
+                if (rdp->icmp_socket == -1)
                 {
                     rdplib_platform_icmp_error_t error;
 
-                    while (rdplib_platform_receive_icmp_error(owner->ipv4_socket, &error))
+                    while (rdplib_platform_receive_icmp_error(rdp->udp_socket, &error))
                     {
-                        // Match the recovered raw receiver's accepted ICMP
-                        // types. Only type 3/code 3 aborts the connection.
                         if (error.type == 3 || error.type == 4 || error.type == 11)
                         {
-                            rdp_handle_reported_icmp(owner, error.remote_address, error.type, error.code, 0, 0, error.source_address);
+                            rdplib_rdp_handle_reported_icmp(rdp, (struct sockaddr *)(void *)error.remote_address, error.type, error.code, 0, 0,
+                                                            (struct sockaddr_in *)(void *)error.source_address);
                         }
                     }
                 }
 #endif
                 do
                 {
-                    packet_bytes = rdplib_platform_receive_datagram(owner->ipv4_socket, packet, sizeof(packet), source_address);
+                    uint32_t quit;
+
+                    char_recv = rdplib_platform_receive_datagram(rdp->udp_socket, (uint8_t *)scratch, sizeof(scratch), (uint8_t *)&remote_addr);
 #if defined(_WIN32) && !defined(RDPLIB_SOURCE_FAITHFUL)
-                    if (packet_bytes == RDPLIB_PLATFORM_RECEIVE_ICMP_PORT_UNREACHABLE)
+                    if (char_recv == RDPLIB_PLATFORM_RECEIVE_ICMP_PORT_UNREACHABLE)
                     {
-                        wake_token = 0;
-                        rdp_handle_reported_icmp(owner, source_address, 3, 3, 0, 0, unknown_icmp_source);
+                        memset(&unknown_icmp_source, 0, sizeof(unknown_icmp_source));
+                        quit = 0;
+                        rdplib_rdp_handle_reported_icmp(rdp, &remote_addr, 3, 3, 0, 0, &unknown_icmp_source);
                     }
                     else
 #endif
                     {
-                        wake_token = rdp_handle_data_recv(owner, packet, packet_bytes, source_address);
+                        quit = rdp_handle_data_recv(rdp, scratch, char_recv, &remote_addr);
                     }
-                } while (!wake_token && packet_bytes != -1);
+                    if (quit || char_recv == -1)
+                    {
+                        break;
+                    }
+                } while (1);
             }
 
-            if ((ready_sources & RDP_IO_SOURCE_LEGACY) != 0 && owner->ipx_socket != -1)
+            if ((ready_sources & RDPLIB_PLATFORM_IO_SOURCE_IPX) != 0 && rdp->ipx_socket != -1)
             {
                 do
                 {
-                    memset(source_address, 0, sizeof(source_address));
-                    packet_bytes = rdplib_platform_receive_datagram(owner->ipx_socket, packet, sizeof(packet), source_address);
-                    wake_token = rdp_handle_data_recv(owner, packet, packet_bytes, source_address);
-                } while (!wake_token && packet_bytes != -1);
+                    uint32_t quit;
+
+                    memset(&remote_addr, 0, sizeof(remote_addr));
+                    char_recv = rdplib_platform_receive_datagram(rdp->ipx_socket, (uint8_t *)scratch, sizeof(scratch), (uint8_t *)&remote_addr);
+                    quit = rdp_handle_data_recv(rdp, scratch, char_recv, &remote_addr);
+                    if (quit || char_recv == -1)
+                    {
+                        break;
+                    }
+                } while (1);
             }
 
-            if ((ready_sources & RDP_IO_SOURCE_ICMP) != 0 && owner->icmp_receive_socket != -1)
+            if ((ready_sources & RDPLIB_PLATFORM_IO_SOURCE_ICMP) != 0 && rdp->icmp_socket != -1)
             {
                 do
                 {
-                    memset(source_address, 0, sizeof(source_address));
-                    packet_bytes = rdplib_platform_receive_datagram(owner->icmp_receive_socket, packet, sizeof(packet), source_address);
-                    rdp_handle_icmp_recv(owner, packet, (uint32_t)packet_bytes, source_address);
-                } while (packet_bytes != -1);
+                    memset(&remote_addr, 0, sizeof(remote_addr));
+                    char_recv = rdplib_platform_receive_datagram(rdp->icmp_socket, (uint8_t *)scratch, sizeof(scratch), (uint8_t *)&remote_addr);
+                    rdp_handle_icmp_recv(rdp, scratch, char_recv, (struct sockaddr_in *)&remote_addr);
+                } while (char_recv != -1);
             }
         }
 
-        now_ms = rdplib_platform_current_time_ms();
-        elapsed_ms = now_ms - owner->rate_sample_time_ms;
-        if (elapsed_ms > 1000)
+        current_time = time_get_ms();
+        elapsed_time = current_time - rdp->last_sample;
+        if (elapsed_time > 1000u)
         {
-            owner->input_bytes_per_second = 1000u * owner->input_bytes / elapsed_ms;
-            owner->duplicate_input_bytes_per_second = 1000u * owner->duplicate_input_bytes / elapsed_ms;
-            owner->input_bytes = 0;
-            owner->duplicate_input_bytes = 0;
-            owner->rate_sample_time_ms = now_ms;
+            rdp->bytes_per_second = 1000u * rdp->bytes_recvd / elapsed_time;
+            rdp->duplicate_bytes_per_second = 1000u * rdp->duplicate_bytes_recvd / elapsed_time;
+            rdp->bytes_recvd = 0;
+            rdp->duplicate_bytes_recvd = 0;
+            rdp->last_sample = current_time;
         }
 
-        last_event_pass_time_ms = rdplib_platform_current_time_ms();
+        max_time = time_get_ms();
         for (;;)
         {
-            rdplib_platform_mutex_lock(&owner->events.lock);
-            connection = (connection_t *)pqueue_peek_head(&owner->events.queue);
-            if (!connection || connection->event_timeout.infinite || (int32_t)(last_event_pass_time_ms - connection->event_timeout.deadline_ms) < 0)
+            struct sockaddr addr;
+
+            eventq_lock(&rdp->conn_eventq);
+            c = eventq_peek_head(&rdp->conn_eventq);
+            if (!c || c->cn_event_time.infinite || (int32_t)(max_time - c->cn_event_time.time) < 0)
             {
-                connection = NULL;
+                c = NULL;
             }
             else
             {
-                memcpy(remote_address, connection->transmit.remote_address, sizeof(remote_address));
+                memcpy(&addr, &c->tx_remote_addr, sizeof(addr));
             }
-            rdplib_platform_mutex_unlock(&owner->events.lock);
-
-            if (!connection)
+            eventq_unlock(&rdp->conn_eventq);
+            if (!c)
             {
                 break;
             }
 
-            connection = connhash_lock(&owner->connections, remote_address);
-            if (!connection)
+            c = rdp_lock_addr(rdp, &addr);
+            if (c)
             {
-                continue;
-            }
-
-            connection_event_process(connection, last_event_pass_time_ms, &next_timeout);
-            if (connection_linger_expired(connection))
-            {
-                (void)connhash_subref(&owner->connections, connection);
-            }
-            else
-            {
-                if (!connection->transmit.connected && !connection->transmit.disconnect_message_queued)
+                connection_event_process(c, max_time, &next_event);
+                if (connection_linger_expired(c))
                 {
-                    arrival = (msg_arrival_t *)fast_malloc((uint32_t)sizeof(*arrival));
-                    msg_arrival_init_disconnect_msg(arrival, connection);
-                    rdp_enqueue_arrival(&owner->application_receive, arrival);
-                    connection->transmit.disconnect_message_queued = 1;
+                    rdp_connection_mark_for_delete(rdp, c);
                 }
-
-                rdplib_platform_mutex_lock(&owner->events.lock);
-                if (memcmp(&connection->event_timeout, &next_timeout, sizeof(next_timeout)) != 0)
+                else
                 {
-                    connection->event_timeout = next_timeout;
-                    pqueue_resort_by_link(&owner->events.queue, &connection->event_link);
+                    if (tx_needs_disconnect_msg(c))
+                    {
+                        rdp_enqueue_disconnect_msg(rdp, c);
+                    }
+                    eventq_lock(&rdp->conn_eventq);
+                    if (memcmp(&c->cn_event_time, &next_event, sizeof(next_event)) != 0)
+                    {
+                        c->cn_event_time = next_event;
+                        eventq_resort_by_ptr(&rdp->conn_eventq, c);
+                    }
+                    eventq_unlock(&rdp->conn_eventq);
                 }
-                rdplib_platform_mutex_unlock(&owner->events.lock);
+                rdp_unlock(c);
             }
-            rdp_unlock(connection);
         }
     }
 
-    rdp_destroy_internal(owner);
-    return 0;
-}
-
-void rdp_resort(connection_t *connection, int wake)
-{
-    rdp_t *owner = connection->owner;
-    rdp_timeout_data_t timeout;
-
-    connection_recalc_event_timeout(connection, &timeout);
-    rdplib_platform_mutex_lock(&owner->events.lock);
-    if (memcmp(&connection->event_timeout, &timeout, sizeof(timeout)) != 0)
-    {
-        connection->event_timeout = timeout;
-        pqueue_resort_by_link(&owner->events.queue, &connection->event_link);
-
-        if (pqueue_peek_head(&owner->events.queue) == connection && owner->io_wakeup_pending == 0 && wake)
-        {
-            rdplib_platform_send_wakeup(owner->ipv4_socket, owner->ipv4_address, 0);
-            owner->io_wakeup_pending = 1;
-        }
-    }
-    rdplib_platform_mutex_unlock(&owner->events.lock);
-}
-
-void rdp_destroy_internal(rdp_t *owner)
-{
-    connection_t *connection;
-    msg_arrival_t *message;
-
-    while ((connection = (connection_t *)pqueue_remove_head(&owner->events.queue)) != NULL)
-    {
-        connection = rdp_connection_mark_for_delete(owner, connection);
-        connection_destroy(connection);
-        rdplib_platform_free(connection);
-    }
-
-    while ((message = (msg_arrival_t *)list_remove_head(&owner->application_receive.producer_queue.messages)) != NULL)
-    {
-        fast_free(message);
-    }
-    while ((message = (msg_arrival_t *)list_remove_head(&owner->application_receive.consumer_queue.messages)) != NULL)
-    {
-        fast_free(message);
-    }
-
-    if (owner->ipv4_socket != -1)
-    {
-        rdplib_platform_socket_close(owner->ipv4_socket);
-    }
-    owner->ipv4_socket = -1;
-    if (owner->icmp_receive_socket != -1)
-    {
-        rdplib_platform_socket_close(owner->icmp_receive_socket);
-    }
-    owner->icmp_receive_socket = -1;
-    if (owner->icmp_probe_socket != -1)
-    {
-        rdplib_platform_socket_close(owner->icmp_probe_socket);
-    }
-    owner->icmp_probe_socket = -1;
-    if (owner->ipx_socket != -1)
-    {
-        rdplib_platform_socket_close(owner->ipx_socket);
-    }
-    owner->ipx_socket = -1;
-    if (owner->sockets_initialized)
-    {
-        rdplib_platform_network_cleanup();
-        owner->sockets_initialized = 0;
-    }
-
-#ifdef _WIN32
-    serial_destroy_windows(&owner->serial);
-#else
-    serial_destroy_mac(&owner->serial);
+    rdp_destroy_internal(rdp);
+#ifdef RDPLIB_DEBUG
+    dpf(0x20u, "io_thread exiting\n");
 #endif
-    connhash_destroy(&owner->connections);
-    eventq_destroy(&owner->events);
-    rdplib_platform_semaphore_destroy(&owner->application_receive.arrival_semaphore);
-    list_destroy(&owner->application_receive.producer_queue.messages);
-    rdplib_platform_mutex_destroy(&owner->application_receive.producer_lock);
-    list_destroy(&owner->application_receive.consumer_queue.messages);
-    rdplib_platform_mutex_destroy(&owner->application_receive.consumer_lock);
-
-    if (!owner->join_io_thread_on_destroy)
-    {
-        rdplib_platform_thread_destroy(owner->io_thread);
-        rdplib_platform_free(owner);
-    }
 }
 
-void rdp_destroy(rdp_t *owner, int wait_for_io_thread)
+void rdp_enqueue_disconnect_msg(rdp_t *rdp, connection_t *c)
 {
-    uint32_t exit_code;
+    msg_arrival_t *not_connected;
 
-    if (owner->io_thread_running != 1)
-    {
-        return;
-    }
-
-    owner->join_io_thread_on_destroy = wait_for_io_thread != 0;
-    owner->io_thread_running = 0;
-    rdplib_platform_send_wakeup(owner->ipv4_socket, owner->ipv4_address, 1);
-
-    if (wait_for_io_thread)
-    {
-        rdplib_platform_thread_wait(owner->io_thread, &exit_code);
-        rdplib_platform_thread_destroy(owner->io_thread);
-        rdplib_platform_free(owner);
-    }
+#ifdef RDPLIB_DEBUG
+    dpf(0x2000u, "enqueue_disconnect_msg\n");
+#endif
+    not_connected = (msg_arrival_t *)fast_malloc((uint32_t)sizeof(*not_connected));
+    msg_arrival_init_disconnect_msg(not_connected, c);
+    rdp_enqueue_arrival(rdp, not_connected);
+    c->tx_enqueued_disconnect_msg = 1;
 }
 
-connection_t *rdp_connection_mark_for_delete(rdp_t *owner, connection_t *connection)
+void rdp_init(rdp_t *rdp)
 {
-    return connhash_subref(&owner->connections, connection);
+    rdp->startup = 0;
+    rdp->udp_socket = -1;
+    rdp->ipx_socket = -1;
+    rdp->icmp_socket = -1;
+    rdp->trace_socket = -1;
+    memset(&rdp->local_udp_addr, 0, sizeof(rdp->local_udp_addr));
+    memset(&rdp->trace_local_addr, 0, sizeof(rdp->trace_local_addr));
+#if !defined(RDPLIB_DEBUG) && !defined(RDPLIB_SOURCE_FAITHFUL)
+    // Localhost rejection can inspect the complete normalized address record even when no IPX socket was created.
+    memset(&rdp->local_ipx_addr, 0, offsetof(rdp_t, udp_socket_ttl) - offsetof(rdp_t, local_ipx_addr));
+#endif
+    rdp->udp_socket_ttl = 0;
+    rdp->udp_broadcast = 0;
+    rdp->ipx_broadcast = 0;
+    rdp->bytes_recvd = 0;
+    rdp->duplicate_bytes_recvd = 0;
+    rdp->bytes_recvd = 0;
+    rdp->duplicate_bytes_per_second = 0;
+    serial_init(&rdp->serial);
+    connhash_init(&rdp->addr_map);
+    eventq_init(&rdp->conn_eventq);
+    rdp->wake_sent = 0;
+    uthread_init(&rdp->io_thread);
+    usemaphore_init(&rdp->receive_semaphore);
+    rxq_init(&rdp->message_rxq);
+    umutex_create(&rdp->message_rxq_mutex);
+    rxq_init(&rdp->external_rxq);
+    umutex_create(&rdp->external_rxq_mutex);
+    rdp->last_sample = time_get_ms();
 }
 
-int connection_close_wait(connection_t *connection, uint32_t timeout_ms, int *result)
+uint32_t rdp_create(rdp_t **out_rdp, uint16_t local_port, uint32_t connections, uint32_t flags)
 {
-    rdplib_platform_event_t completion_event;
-    int create_result;
+    rdp_t *rdp;
+    uint32_t namelen;
+#ifdef RDPLIB_SOURCE_FAITHFUL
+    int ipproto_icmp;
+#endif
+    int ipproto_udp;
+#ifdef RDPLIB_SOURCE_FAITHFUL
+    uint32_t udp_ttl_len;
+#endif
+    int err;
+    uint32_t result;
+    int32_t on;
+    uint16_t ver;
+#ifdef RDPLIB_SOURCE_FAITHFUL
+    struct sockaddr_in local_addr;
+#endif
+    struct sockaddr_ipx sipx;
 
-    rdplib_platform_event_init(&completion_event);
-    create_result = rdplib_platform_event_create(&completion_event);
-    if (create_result != 0)
+    result = 0;
+    *out_rdp = NULL;
+    rdp = (rdp_t *)rdplib_platform_malloc(sizeof(*rdp));
+    if (!rdp)
     {
-        create_result = 1;
+        return 2;
+    }
+    rdp_init(rdp);
+
+    ver = UINT16_C(0x0101);
+    err = rdplib_platform_network_startup(ver);
+    if (err)
+    {
+        result = 1;
+        goto exit;
+    }
+    rdp->startup = 1;
+
+    result = serial_create(&rdp->serial, g_next_local_port++);
+    if (result)
+    {
+        goto exit;
+    }
+    serial_set_time_next_recv(&rdp->serial, time_get_ms());
+    result = connhash_create(&rdp->addr_map, (uint16_t)(connections == 1 ? 1 : 12));
+    if (result)
+    {
+        goto exit;
+    }
+    result = eventq_create(&rdp->conn_eventq, 2u * connections);
+    if (result)
+    {
+        goto exit;
+    }
+    result = usemaphore_create(&rdp->receive_semaphore);
+    if (result)
+    {
+        goto exit;
+    }
+
+    ipproto_udp = rdplib_platform_protocol_number("udp", 17);
+    if ((flags & RDP_CREATE_REQUIRE_IPV4) || (flags & RDP_CREATE_ATTEMPT_BOTH))
+    {
+        rdp->udp_socket = rdplib_platform_socket_create(AF_INET, RDP_SOCKET_TYPE_DATAGRAM, ipproto_udp);
+    }
+    if ((flags & RDP_CREATE_REQUIRE_IPV4) && rdp->udp_socket == -1)
+    {
+        result = 10;
+        goto exit;
+    }
+    if ((flags & RDP_CREATE_REQUIRE_IPX) || (flags & RDP_CREATE_ATTEMPT_BOTH))
+    {
+        rdp->ipx_socket = rdplib_platform_socket_create(RDP_TRANSMIT_ADDRESS_IPX, RDP_SOCKET_TYPE_DATAGRAM, 1000);
+    }
+    if ((flags & RDP_CREATE_REQUIRE_IPX) && rdp->ipx_socket == -1)
+    {
+        result = 10;
+        goto exit;
+    }
+
+    if (rdp->udp_socket != -1)
+    {
+        memset(&rdp->local_udp_addr, 0, sizeof(rdp->local_udp_addr));
+        rdp->local_udp_addr.sin_family = AF_INET;
+        rdp->local_udp_addr.sin_port = htons(local_port);
+        err = rdplib_platform_socket_bind(rdp->udp_socket, (const uint8_t *)&rdp->local_udp_addr, sizeof(rdp->local_udp_addr));
+        if (err == -1)
+        {
+            result = rdplib_platform_last_socket_error() == RDP_SOCKET_ERROR_ADDRESS_IN_USE ? 11u : 1u;
+            goto exit;
+        }
+        on = 1;
+        err = rdplib_platform_socket_set_option(rdp->udp_socket, RDP_SOCKET_LEVEL, RDP_SOCKET_BROADCAST, &on, sizeof(on));
+        rdp->udp_broadcast = err == 0;
+        namelen = sizeof(rdp->local_udp_addr);
+        err = rdplib_platform_socket_get_name(rdp->udp_socket, (uint8_t *)&rdp->local_udp_addr, &namelen);
+        if (err == -1)
+        {
+            result = 1;
+            goto exit;
+        }
+        result = disable_blocking(rdp->udp_socket);
+        if (result)
+        {
+            goto exit;
+        }
+
+#ifndef RDPLIB_SOURCE_FAITHFUL
+#if defined(__linux__) || defined(_WIN32)
+        if (rdplib_platform_enable_icmp_errors(rdp->udp_socket) != 0)
+        {
+            rdplib_platform_record_socket_error(rdplib_platform_last_socket_error());
+        }
+#endif
+#else
+        ipproto_icmp = rdplib_platform_protocol_number("icmp", 1);
+        rdp->icmp_socket = rdplib_platform_socket_create(AF_INET, RDP_SOCKET_TYPE_RAW, ipproto_icmp);
+        if (rdp->icmp_socket == -1)
+        {
+#ifdef RDPLIB_DEBUG
+            dpf(0x800020u, "icmp not available: %s\n", net_strerror((uint32_t)rdplib_platform_last_socket_error()));
+#endif
+            (void)net_strerror((uint32_t)rdplib_platform_last_socket_error());
+        }
+        else
+        {
+            result = disable_blocking(rdp->icmp_socket);
+            if (result)
+            {
+                goto exit;
+            }
+            memset(&local_addr, 0, sizeof(local_addr));
+            local_addr.sin_family = AF_INET;
+            local_addr.sin_port = 0;
+            err = rdplib_platform_socket_bind(rdp->icmp_socket, (const uint8_t *)&local_addr, sizeof(local_addr));
+            if (err == -1)
+            {
+                result = 1;
+                goto exit;
+            }
+#ifdef RDPLIB_DEBUG
+            dpf(0x800020u, "icmp socket created\n");
+#endif
+
+            rdp->trace_socket = rdplib_platform_socket_create(AF_INET, RDP_SOCKET_TYPE_DATAGRAM, ipproto_udp);
+            if (rdp->trace_socket == -1)
+            {
+                result = 1;
+                goto exit;
+            }
+            memset(&rdp->trace_local_addr, 0, sizeof(rdp->trace_local_addr));
+            rdp->trace_local_addr.sin_family = AF_INET;
+            err = rdplib_platform_socket_bind(rdp->trace_socket, (const uint8_t *)&rdp->trace_local_addr, sizeof(rdp->trace_local_addr));
+            if (err == -1)
+            {
+                result = 1;
+                goto exit;
+            }
+            namelen = sizeof(rdp->trace_local_addr);
+            err = rdplib_platform_socket_get_name(rdp->trace_socket, (uint8_t *)&rdp->trace_local_addr, &namelen);
+            if (err == -1)
+            {
+                result = 1;
+                goto exit;
+            }
+            result = disable_blocking(rdp->trace_socket);
+            if (result)
+            {
+                goto exit;
+            }
+
+            udp_ttl_len = sizeof(rdp->udp_socket_ttl);
+            err = rdplib_platform_socket_get_option(rdp->trace_socket, RDP_IP_LEVEL, RDP_IP_TTL, &rdp->udp_socket_ttl, &udp_ttl_len);
+            if (err)
+            {
+                int socket_error = rdplib_platform_last_socket_error();
+                if (socket_error != RDP_SOCKET_ERROR_OPTION_UNSUPPORTED)
+                {
+#ifdef RDPLIB_DEBUG
+                    dpf(0x10000020u, "setsockopt: %s\n", net_strerror((uint32_t)rdplib_platform_last_socket_error()));
+#endif
+                    (void)net_strerror((uint32_t)rdplib_platform_last_socket_error());
+                    result = 1;
+                    goto exit;
+                }
+#ifdef RDPLIB_DEBUG
+                dpf(0x10000020u, "winsock provider does not support getsockopt( IPPROTO_IP, IP_TTL )\n");
+#endif
+                rdplib_platform_socket_close(rdp->trace_socket);
+                rdp->trace_socket = -1;
+            }
+            if (rdp->trace_socket != -1)
+            {
+                err = rdplib_platform_socket_set_option(rdp->trace_socket, RDP_IP_LEVEL, RDP_IP_TTL, &rdp->udp_socket_ttl, sizeof(rdp->udp_socket_ttl));
+                if (err)
+                {
+                    int socket_error = rdplib_platform_last_socket_error();
+                    if (socket_error != RDP_SOCKET_ERROR_OPTION_UNSUPPORTED)
+                    {
+#ifdef RDPLIB_DEBUG
+                        dpf(0x10000020u, "setsockopt: %s\n", net_strerror((uint32_t)rdplib_platform_last_socket_error()));
+#endif
+                        (void)net_strerror((uint32_t)rdplib_platform_last_socket_error());
+                        result = 1;
+                        goto exit;
+                    }
+#ifdef RDPLIB_DEBUG
+                    dpf(0x10000020u, "winsock provider does not support setsockopt( IPPROTO_IP, IP_TTL )\n");
+#endif
+                    rdplib_platform_socket_close(rdp->trace_socket);
+                    rdp->trace_socket = -1;
+                }
+            }
+            if (rdp->trace_socket != -1)
+            {
+#ifdef RDPLIB_DEBUG
+                dpf(0x10000020u, "trace socket created\n");
+#endif
+            }
+        }
+#endif
+    }
+
+    if (rdp->ipx_socket != -1)
+    {
+        memset(&sipx, 0, sizeof(sipx));
+        sipx.sa_family = RDP_TRANSMIT_ADDRESS_IPX;
+        sipx.sa_socket = local_port;
+        err = rdplib_platform_socket_bind(rdp->ipx_socket, (const uint8_t *)&sipx, sizeof(sipx));
+        if (err == -1)
+        {
+            result = rdplib_platform_last_socket_error() == RDP_SOCKET_ERROR_ADDRESS_IN_USE ? 11u : 1u;
+            goto exit;
+        }
+        on = 1;
+        err = rdplib_platform_socket_set_option(rdp->ipx_socket, RDP_SOCKET_LEVEL, RDP_SOCKET_BROADCAST, &on, sizeof(on));
+        rdp->ipx_broadcast = err == 0;
+        namelen = sizeof(rdp->local_ipx_addr);
+        err = rdplib_platform_socket_get_name(rdp->ipx_socket, (uint8_t *)&rdp->local_ipx_addr, &namelen);
+        if (err == -1)
+        {
+            result = 1;
+            goto exit;
+        }
+        result = disable_blocking(rdp->ipx_socket);
+        if (result)
+        {
+            goto exit;
+        }
+    }
+
+    rdp->encrypt = (flags & RDP_CREATE_USE_ENCRYPTION) != 0;
+    rdp->crc = (flags & RDP_CREATE_USE_CRC) != 0;
+    rdp->io_thread_running = 1;
+    result = uthread_create(&rdp->io_thread, rdp_io_thread, rdp);
+    if (result)
+    {
+        rdp->io_thread_running = 0;
     }
     else
     {
-        create_result = 0;
-        (void)connection_close(connection, timeout_ms, result, &completion_event);
-        (void)rdplib_platform_event_wait(&completion_event);
+        *out_rdp = rdp;
     }
-    rdplib_platform_event_destroy(&completion_event);
-    return create_result;
+
+exit:
+    if (result)
+    {
+        rdp->app_is_waiting_for_exit = 0;
+        rdp_destroy_internal(rdp);
+    }
+    return result;
 }
 
-msg_arrival_t *rdp_receive(rdp_t *owner, int32_t timeout_ms)
+#ifdef RDP_DEAD_CODE
+// unused, retained for historical interest
+void rdp_shutdown(uint32_t linger_time)
 {
-    rdp_application_receive_t *receive;
-    msg_arrival_t *message;
-    uint32_t deadline = 0;
-    int32_t remaining = timeout_ms;
-
-    if (!owner)
-    {
-        return NULL;
-    }
-    receive = &owner->application_receive;
-
-    rdplib_platform_mutex_lock(&receive->consumer_lock);
-    message = (msg_arrival_t *)list_remove_head(&receive->consumer_queue.messages);
-    rdplib_platform_mutex_unlock(&receive->consumer_lock);
-    if (message)
-    {
-        return message;
-    }
-
-    if (timeout_ms != 0 && timeout_ms != -1)
-    {
-        deadline = rdplib_platform_current_time_ms() + (uint32_t)timeout_ms;
-    }
-
-    do
-    {
-        if (owner->serial.endpoint != -1)
-        {
-            uint8_t packet[536];
-            uint8_t source_address[16];
-            int32_t packet_bytes;
-
-            do
-            {
-#ifdef _WIN32
-                packet_bytes = serial_recv_from_windows(&owner->serial, packet, sizeof(packet), source_address);
-#else
-                packet_bytes = serial_recv_from_mac(&owner->serial, packet, sizeof(packet), source_address);
+#ifdef RDPLIB_DEBUG
+    dpf(0x20u, "rdp_shutdown()\n");
 #endif
-                (void)rdp_handle_data_recv(owner, packet, packet_bytes, source_address);
-            } while (packet_bytes != -1);
-            serial_set_time_next_recv(&owner->serial, rdplib_platform_current_time_ms() + 100u);
-        }
-
-        if (!rdplib_platform_semaphore_wait(&receive->arrival_semaphore, remaining))
-        {
-            return NULL;
-        }
-
-        rdplib_platform_mutex_lock(&receive->producer_lock);
-        rdplib_platform_mutex_lock(&receive->consumer_lock);
-
-        // The receiving application thread guarantees this list is empty. The
-        // clients copy all 5 list words rather than splice or append.
-        receive->consumer_queue.messages = receive->producer_queue.messages;
-        list_init(&receive->producer_queue.messages);
-        message = (msg_arrival_t *)list_remove_head(&receive->consumer_queue.messages);
-
-        rdplib_platform_mutex_unlock(&receive->consumer_lock);
-        rdplib_platform_mutex_unlock(&receive->producer_lock);
-        if (message)
-        {
-            return message;
-        }
-
-        if (timeout_ms != 0 && timeout_ms != -1)
-        {
-            remaining = (int32_t)(deadline - rdplib_platform_current_time_ms());
-        }
-    } while (timeout_ms != 0 && (timeout_ms == -1 || remaining > 0));
-
-    return NULL;
+    sleep_ms(linger_time);
 }
+#endif
 
-void rdp_unlock(connection_t *connection)
+void rdp_destroy(rdp_t *rdp, int wait)
 {
-    rdp_t *owner = connection->owner;
-    connection_t *released;
+    uint32_t exit_code;
 
-    rdplib_platform_mutex_unlock(&connection->lock);
-    released = connhash_subref(&owner->connections, connection);
-    if (released)
+#ifdef RDPLIB_DEBUG
+    dpf(0x20u, "rdp_destroy\n");
+#endif
+    if (rdp->io_thread_running == 1)
     {
-        rdplib_platform_mutex_lock(&owner->events.lock);
-        pqueue_remove_by_link(&owner->events.queue, &released->event_link);
-        rdplib_platform_mutex_unlock(&owner->events.lock);
-        connection_destroy(released);
-        rdplib_platform_free(released);
+        rdp->app_is_waiting_for_exit = wait != 0;
+        rdp->io_thread_running = 0;
+        (void)rdp_wake(rdp, 1);
+        if (wait)
+        {
+#ifdef RDPLIB_DEBUG
+            dpf(0x20u, "waiting for thread exit\n");
+#endif
+            (void)uthread_wait_exit_code(&rdp->io_thread, &exit_code);
+            uthread_destroy(&rdp->io_thread);
+            rdplib_platform_free(rdp);
+        }
     }
 }
 
-uint32_t rdp_get_input_rate(const rdp_t *owner)
+uint32_t rdp_connect_sa(rdp_t *rdp, connection_t **new_c, struct sockaddr *remote_addr, uint32_t flags)
 {
-    return owner->input_bytes_per_second;
+    connection_t *c;
+    uint32_t result;
+
+    ++g_rdp_stat->connection_requests;
+    result = rdp_connection_create_internal(rdp, &c, remote_addr, flags);
+    if (!result)
+    {
+        c->cn_accepted = 1;
+        rdp_unlock(c);
+        *new_c = c;
+    }
+    return result;
 }
 
-int rdp_serial_tx_ready(rdp_t *owner)
+#ifdef RDP_DEAD_CODE
+// unused, retained for historical interest
+uint32_t rdp_send(rdp_t *rdp, struct sockaddr *remote_addr, uint16_t port, const char *data, uint32_t size)
 {
-    return serial_tx_ready(&owner->serial);
+    iov_t iov[2];
+    uint32_t result;
+    uint16_t options;
+    struct sockaddr_ipx sipx;
+    struct sockaddr_in sin;
+    sockaddr_com scom;
+
+    result = 0;
+    options = htons(UINT16_C(0xFFFF));
+    if (!rdp)
+    {
+        return 6;
+    }
+    if (size > 512)
+    {
+#ifdef RDPLIB_DEBUG
+        dpf(0x400000u, "RDP_SEND_ERROR_TOO_BIG %u bytes\n", size);
+#endif
+        return RDP_SEND_ERROR_TOO_BIG;
+    }
+    iov[0].data = &options;
+    iov[0].size = sizeof(options);
+    iov[1].data = (void *)data;
+    iov[1].size = size;
+    if (remote_addr)
+    {
+        switch (remote_addr->sa_family)
+        {
+        case RDP_TRANSMIT_ADDRESS_IPV4:
+            result = usend(rdp->udp_socket, iov, 2, remote_addr, rdp->encrypt, 0);
+            break;
+        case RDP_TRANSMIT_ADDRESS_IPX:
+            result = usend(rdp->ipx_socket, iov, 2, remote_addr, rdp->encrypt, 0);
+            break;
+        case RDP_TRANSMIT_ADDRESS_SERIAL:
+            result = serial_send(&rdp->serial, iov, 2, (sockaddr_com *)remote_addr);
+            break;
+        }
+        return result;
+    }
+    if (rdp->ipx_broadcast)
+    {
+        memset(&sipx, 0, sizeof(sipx));
+        sipx.sa_family = RDP_TRANSMIT_ADDRESS_IPX;
+        sipx.sa_socket = port;
+        memset(sipx.sa_nodenum, 0xFF, sizeof(sipx.sa_nodenum));
+        result = usend(rdp->ipx_socket, iov, 2, (struct sockaddr *)&sipx, rdp->encrypt, 0);
+    }
+    if (rdp->udp_broadcast)
+    {
+        memset(&sin, 0, sizeof(sin));
+        sin.sin_family = RDP_TRANSMIT_ADDRESS_IPV4;
+        sin.sin_addr.s_addr = htonl(UINT32_C(0xFFFFFFFF));
+        sin.sin_port = htons(port);
+        result = usend(rdp->udp_socket, iov, 2, (struct sockaddr *)&sin, rdp->encrypt, 0);
+    }
+    if ((intptr_t)rdp->serial.file != -1)
+    {
+        memset(&scom, 0, sizeof(scom));
+        scom.scom_family = RDP_TRANSMIT_ADDRESS_SERIAL;
+        result = serial_send(&rdp->serial, iov, 2, &scom);
+    }
+    (void)result;
+    return 0;
 }
 
-uint32_t rdp_serial_get_time_empty(rdp_t *owner)
+uint32_t rdp_send_oversized(rdp_t *rdp, struct sockaddr *remote_addr, uint16_t port, const char *data, uint32_t size)
 {
-    return serial_get_time_empty(&owner->serial);
+    iov_t iov[2];
+    uint32_t result;
+    uint16_t options;
+    struct sockaddr_ipx sipx;
+    struct sockaddr_in sin;
+    sockaddr_com scom;
+
+    result = 0;
+    options = htons(UINT16_C(0xFFFF));
+    if (!rdp)
+    {
+        return 6;
+    }
+    iov[0].data = &options;
+    iov[0].size = sizeof(options);
+    iov[1].data = (void *)data;
+    iov[1].size = size;
+    if (remote_addr)
+    {
+        switch (remote_addr->sa_family)
+        {
+        case RDP_TRANSMIT_ADDRESS_IPV4:
+            result = usend(rdp->udp_socket, iov, 2, remote_addr, rdp->encrypt, 0);
+            break;
+        case RDP_TRANSMIT_ADDRESS_IPX:
+            result = usend(rdp->ipx_socket, iov, 2, remote_addr, rdp->encrypt, 0);
+            break;
+        case RDP_TRANSMIT_ADDRESS_SERIAL:
+            result = serial_send(&rdp->serial, iov, 2, (sockaddr_com *)remote_addr);
+            break;
+        }
+        return result;
+    }
+    if (rdp->ipx_broadcast)
+    {
+        memset(&sipx, 0, sizeof(sipx));
+        sipx.sa_family = RDP_TRANSMIT_ADDRESS_IPX;
+        sipx.sa_socket = port;
+        memset(sipx.sa_nodenum, 0xFF, sizeof(sipx.sa_nodenum));
+        result = usend(rdp->ipx_socket, iov, 2, (struct sockaddr *)&sipx, rdp->encrypt, 0);
+    }
+    if (rdp->udp_broadcast)
+    {
+        memset(&sin, 0, sizeof(sin));
+        sin.sin_family = RDP_TRANSMIT_ADDRESS_IPV4;
+        sin.sin_addr.s_addr = htonl(UINT32_C(0xFFFFFFFF));
+        sin.sin_port = htons(port);
+        result = usend(rdp->udp_socket, iov, 2, (struct sockaddr *)&sin, rdp->encrypt, 0);
+    }
+    if ((intptr_t)rdp->serial.file != -1)
+    {
+        memset(&scom, 0, sizeof(scom));
+        scom.scom_family = RDP_TRANSMIT_ADDRESS_SERIAL;
+        result = serial_send(&rdp->serial, iov, 2, &scom);
+    }
+    (void)result;
+    return 0;
+}
+#endif
+
+#if defined(RDPLIB_DEBUG) || defined(RDPLIB_SOURCE_FAITHFUL)
+void format_sockaddr(char *buf, struct sockaddr *sa)
+{
+    struct sockaddr_in *sin;
+#if defined(RDPLIB_DEBUG) || defined(_WIN32)
+    char netnum[16];
+    struct sockaddr_ipx *sipx;
+    char nodenum[16];
+#endif
+    sockaddr_com *scom;
+
+    switch (sa->sa_family)
+    {
+    case RDP_TRANSMIT_ADDRESS_IPV4:
+        sin = (struct sockaddr_in *)sa;
+        sprintf(buf, "AF_INET %s:%u", inet_ntoa(sin->sin_addr), ntohs(sin->sin_port));
+        break;
+    case RDP_TRANSMIT_ADDRESS_IPX:
+#ifdef RDPLIB_SOURCE_FAITHFUL
+#ifdef _WIN32
+        sipx = (struct sockaddr_ipx *)sa;
+        // Unsafe historical behavior: the Windows clients passed both uninitialized arrays to %s.
+        sprintf(buf, "AF_IPX %s:%s:%u", netnum, nodenum, sipx->sa_socket);
+        break;
+#else
+        return;
+#endif
+#elif defined(RDPLIB_DEBUG)
+        sipx = (struct sockaddr_ipx *)sa;
+        data_format(netnum, (const uint8_t *)sipx->sa_netnum, sizeof(sipx->sa_netnum));
+        data_format(nodenum, (const uint8_t *)sipx->sa_nodenum, sizeof(sipx->sa_nodenum));
+        sprintf(buf, "AF_IPX %s:%s:%u", netnum, nodenum, sipx->sa_socket);
+        break;
+#else
+        return;
+#endif
+    case RDP_TRANSMIT_ADDRESS_SERIAL:
+        scom = (sockaddr_com *)sa;
+        sprintf(buf, "AF_COMPORT %u", (uint32_t)(int32_t)scom->scom_port);
+        break;
+    default:
+        sprintf(buf, "unknown address family (%u)", (uint32_t)(uint16_t)sa->sa_family);
+        break;
+    }
+}
+#endif
+
+uint32_t rdp_connection_create_internal(rdp_t *rdp, connection_t **new_c, struct sockaddr *remote_addr, uint32_t flags)
+{
+    uint32_t flag_mask;
+    connection_t *c;
+    uint32_t result;
+#if defined(RDPLIB_DEBUG) || defined(RDPLIB_SOURCE_FAITHFUL)
+    char temp[64];
+#endif
+
+    result = 0;
+    c = NULL;
+    flag_mask = ~UINT32_C(1);
+    if (flags & flag_mask)
+    {
+        result = 6;
+    }
+    else
+    {
+        c = (connection_t *)rdplib_platform_malloc(sizeof(*c));
+        if (c)
+        {
+            connection_init(c, rdp, remote_addr, flags);
+            result = connection_create(c);
+            if (!result)
+            {
+#ifdef RDPLIB_SOURCE_FAITHFUL
+                format_sockaddr(temp, &c->tx_remote_addr);
+#endif
+#ifdef RDPLIB_DEBUG
+#ifndef RDPLIB_SOURCE_FAITHFUL
+                format_sockaddr(temp, &c->tx_remote_addr);
+#endif
+                dpf(0x4000u, "[0x%08x] new connection %s\n", (uint32_t)(uintptr_t)c, temp);
+#endif
+                eventq_lock(&rdp->conn_eventq);
+                (void)eventq_insert(&rdp->conn_eventq, c);
+                connhash_insert(&rdp->addr_map, c);
+                eventq_unlock(&rdp->conn_eventq);
+                (void)rdp_lock_connection(c);
+                *new_c = c;
+            }
+        }
+        else
+        {
+            result = 2;
+        }
+    }
+    if (result && c)
+    {
+        connection_destroy(c);
+        rdplib_platform_free(c);
+    }
+    return result;
 }
 
-uint32_t rdp_get_serial_stall_time(rdp_t *owner)
+uint32_t rdp_connect(rdp_t *rdp, connection_t **new_c, char *hostname, uint16_t port, uint32_t flags)
 {
-    return serial_get_stall_time(&owner->serial);
+    struct sockaddr_in sin;
+    uint32_t result;
+
+    result = 0;
+    memset(&sin, 0, sizeof(sin));
+    if (rdplib_platform_resolve_ipv4(hostname, port, (uint8_t *)&sin) == 0)
+    {
+        result = rdp_connect_sa(rdp, new_c, (struct sockaddr *)&sin, flags);
+    }
+    else
+    {
+        result = 12;
+    }
+    return result;
 }
+
+void rdp_connection_mark_for_delete(rdp_t *rdp, connection_t *c)
+{
+    connection_t *removed;
+#ifdef RDPLIB_DEBUG
+    uint32_t messages_removed;
+#endif
+
+#ifdef RDPLIB_DEBUG
+    assert(umutex_owner( &c->cn_lock ));
+#endif
+#ifdef RDPLIB_DEBUG
+    assert(c->cn_rdp == rdp);
+#endif
+    removed = connhash_subref(&rdp->addr_map, c);
+#ifdef RDPLIB_DEBUG
+    assert(removed == NULL);
+#endif
+    (void)removed;
+#ifdef RDPLIB_DEBUG
+    // The flush was historically inside assert; keep the debug bookkeeping alive when NDEBUG removes assertions.
+    umutex_lock(&rdp->message_rxq_mutex);
+    messages_removed = rxq_flush_all_messages(&rdp->message_rxq, c);
+    assert(0 == messages_removed);
+    umutex_unlock(&rdp->message_rxq_mutex);
+#endif
+#ifdef RDPLIB_DEBUG
+    dpf(0x2000u, "[0x%08x] removed\n", (uint32_t)(uintptr_t)c);
+#endif
+}
+
+uint32_t connection_close_wait(connection_t *c, uint32_t linger_time, uint32_t *all_acked)
+{
+    uevent_t all_acked_event;
+    uint32_t result;
+
+    result = 0;
+    uevent_init(&all_acked_event);
+    result = uevent_create(&all_acked_event);
+    if (result)
+    {
+        result = 1;
+    }
+    else
+    {
+        (void)connection_close(c, linger_time, all_acked, &all_acked_event);
+        uevent_wait(&all_acked_event);
+    }
+    uevent_destroy(&all_acked_event);
+    return result;
+}
+
+msg_arrival_t *rdp_receive(rdp_t *rdp, uint32_t timeout)
+{
+    msg_arrival_t *msg;
+    uint32_t corrected_timeout;
+    uint32_t stop_wait_time = 0; // Every path that uses stop_wait_time assigns it first; initialize it for MSVC C4701.
+#ifdef RDPLIB_DEBUG
+    uint32_t current_time;
+    uint32_t queueing_delay;
+    char temp[128];
+#endif
+
+    msg = NULL;
+    corrected_timeout = timeout;
+    if (rdp)
+    {
+        umutex_lock(&rdp->external_rxq_mutex);
+        msg = rxq_remove_head(&rdp->external_rxq);
+        umutex_unlock(&rdp->external_rxq_mutex);
+        if (!msg)
+        {
+            if (timeout && timeout != UINT32_MAX)
+            {
+                stop_wait_time = time_get_ms() + timeout;
+            }
+            for (;;)
+            {
+                if ((intptr_t)rdp->serial.file != -1)
+                {
+                    rdp_serial_drain(rdp);
+                }
+                if (!usemaphore_decrement(&rdp->receive_semaphore, corrected_timeout))
+                {
+                    break;
+                }
+                umutex_lock(&rdp->message_rxq_mutex);
+                umutex_lock(&rdp->external_rxq_mutex);
+                memcpy(&rdp->external_rxq, &rdp->message_rxq, sizeof(rdp->external_rxq));
+                memset(&rdp->message_rxq, 0, sizeof(rdp->message_rxq));
+                msg = rxq_remove_head(&rdp->external_rxq);
+                umutex_unlock(&rdp->external_rxq_mutex);
+                umutex_unlock(&rdp->message_rxq_mutex);
+                if (msg)
+                {
+                    break;
+                }
+                if (!timeout)
+                {
+                    break;
+                }
+                if (timeout != UINT32_MAX)
+                {
+                    corrected_timeout = stop_wait_time - time_get_ms();
+                    if ((int32_t)corrected_timeout <= 0)
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+
+#ifdef RDPLIB_DEBUG
+        if (msg)
+        {
+            current_time = time_get_ms();
+            queueing_delay = current_time - msg->enqueue_time;
+            if (g_rdp_stat->rqd_samples)
+            {
+                if (queueing_delay < g_rdp_stat->rqd_min)
+                {
+                    g_rdp_stat->rqd_min = queueing_delay;
+                }
+                if (queueing_delay > g_rdp_stat->rqd_max)
+                {
+                    g_rdp_stat->rqd_max = queueing_delay;
+                }
+                g_rdp_stat->rqd_sum += queueing_delay;
+                g_rdp_stat->rqd_bytes += msg->size;
+            }
+            else
+            {
+                g_rdp_stat->rqd_sum = queueing_delay;
+                g_rdp_stat->rqd_max = g_rdp_stat->rqd_sum;
+                g_rdp_stat->rqd_min = g_rdp_stat->rqd_max;
+            }
+            ++g_rdp_stat->rqd_samples;
+
+            if (current_time - g_rdp_stat->rqd_last_interval > 10000u)
+            {
+                g_rdp_stat->rqd_last_interval = current_time;
+                sprintf(temp, "%I64u rx queueing delay min:%I64u max:%I64u avg:%I64u (%I64u bytes)\n", g_rdp_stat->rqd_samples, g_rdp_stat->rqd_min,
+                        g_rdp_stat->rqd_max, g_rdp_stat->rqd_sum / g_rdp_stat->rqd_samples, g_rdp_stat->rqd_bytes);
+                dpf(0x80u, "%s", temp);
+                g_rdp_stat->rqd_bytes = 0;
+                g_rdp_stat->rqd_sum = 0;
+                g_rdp_stat->rqd_max = 0;
+                g_rdp_stat->rqd_min = 0;
+                g_rdp_stat->rqd_samples = 0;
+            }
+        }
+#endif
+    }
+    return msg;
+}
+
+#ifdef RDP_DEAD_CODE
+// unused, retained for historical interest
+uint32_t rdp_trace_capable(rdp_t *rdp)
+{
+    return rdp->trace_socket != -1;
+}
+
+struct sockaddr *rdp_get_local_addr(rdp_t *rdp, int16_t family)
+{
+    struct sockaddr *sa;
+
+    sa = NULL;
+    if (family == RDP_TRANSMIT_ADDRESS_IPV4)
+    {
+        sa = (struct sockaddr *)&rdp->local_udp_addr;
+    }
+    else if (family == RDP_TRANSMIT_ADDRESS_IPX)
+    {
+        sa = (struct sockaddr *)&rdp->local_ipx_addr;
+    }
+    else if (family == RDP_TRANSMIT_ADDRESS_SERIAL)
+    {
+#ifdef RDPLIB_DEBUG
+        assert(!"why do you want the local address of the com port?");
+#endif
+    }
+    return sa;
+}
+
+uint32_t rdp_get_transport_mask(void)
+{
+    int ipproto_udp;
+    uint32_t avail_transports;
+    intptr_t s;
+    uint16_t ver;
+    int err;
+    struct sockaddr_ipx sipx;
+
+    avail_transports = 0;
+    ver = UINT16_C(0x0101);
+    err = rdplib_platform_network_startup(ver);
+    if (!err)
+    {
+        ipproto_udp = rdplib_platform_protocol_number("udp", 17);
+        s = rdplib_platform_socket_create(AF_INET, RDP_SOCKET_TYPE_DATAGRAM, ipproto_udp);
+        if (s != -1)
+        {
+            avail_transports |= 2;
+            rdplib_platform_socket_close(s);
+        }
+        s = rdplib_platform_socket_create(RDP_TRANSMIT_ADDRESS_IPX, RDP_SOCKET_TYPE_DATAGRAM, 1000);
+        if (s != -1)
+        {
+            uint32_t namelen;
+            uint8_t zero[8] = {0};
+
+            memset(&sipx, 0, sizeof(sipx));
+            sipx.sa_family = RDP_TRANSMIT_ADDRESS_IPX;
+            err = rdplib_platform_socket_bind(s, (const uint8_t *)&sipx, sizeof(sipx));
+            if (err != -1)
+            {
+                namelen = sizeof(sipx);
+                err = rdplib_platform_socket_get_name(s, (uint8_t *)&sipx, &namelen);
+                if (err != -1 && memcmp(zero, sipx.sa_netnum, sizeof(sipx.sa_netnum)) && memcmp(zero, sipx.sa_nodenum, sizeof(sipx.sa_nodenum)))
+                {
+                    avail_transports |= 4;
+                }
+            }
+            rdplib_platform_socket_close(s);
+        }
+        rdplib_platform_network_cleanup();
+    }
+    return avail_transports;
+}
+#endif
+
+uint32_t rdp_get_input_rate(rdp_t *rdp)
+{
+    return rdp->bytes_per_second;
+}
+
+#ifdef RDP_DEAD_CODE
+// unused, retained for historical interest
+uint32_t rdp_get_duplicate_input_rate(rdp_t *rdp)
+{
+    return rdp->duplicate_bytes_per_second;
+}
+#endif
+
+uint32_t rdp_serial_tx_ready(rdp_t *rdp)
+{
+    return serial_tx_ready(&rdp->serial);
+}
+
+uint32_t rdp_serial_get_time_empty(rdp_t *rdp)
+{
+    return serial_get_time_empty(&rdp->serial);
+}
+
+#ifdef RDP_DEAD_CODE
+// unused, retained for historical interest
+void rdp_get_serial_stats(rdp_t *rdp, serial_stat_t *stats)
+{
+    serial_get_stats(&rdp->serial, stats);
+}
+#endif
+
+uint32_t rdp_get_serial_stall_time(rdp_t *rdp)
+{
+    return serial_get_stall_time(&rdp->serial);
+}
+
+void rdplib_rdp_handle_reported_icmp(rdp_t *rdp, struct sockaddr *remote_addr, uint8_t type, uint8_t code, uint8_t trace_response, uint8_t trace_sample,
+                                     struct sockaddr_in *source_addr)
+{
+    connection_t *c;
+
+    c = rdp_lock_addr(rdp, remote_addr);
+    if (!c)
+    {
+        return;
+    }
+#ifndef RDPLIB_SOURCE_FAITHFUL
+    if (!trace_response && !c->tx_connected && c->tx_enqueued_disconnect_msg)
+    {
+        rdp_unlock(c);
+        return;
+    }
+#endif
+    connection_handle_icmp(c, type, code, trace_response, trace_sample, source_addr);
+    if (tx_needs_disconnect_msg(c))
+    {
+        rdp_enqueue_disconnect_msg(rdp, c);
+    }
+    rdp_resort(c, 0);
+    rdp_unlock(c);
+}
+
+#ifdef RDPLIB_DEBUG
+static uint16_t rdplib_rdp_load_native_u16(const void *bytes)
+{
+    uint16_t value;
+
+    memcpy(&value, bytes, sizeof(value));
+    return value;
+}
+#endif

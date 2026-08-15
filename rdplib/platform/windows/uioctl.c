@@ -3,8 +3,12 @@
 
 #include "rdplib_platform.h"
 
-int rdplib_platform_socket_disable_blocking(intptr_t endpoint)
+uint32_t disable_blocking(intptr_t s)
 {
-    u_long enabled = 1;
-    return ioctlsocket((SOCKET)endpoint, FIONBIO, &enabled) == 0 ? 0 : 1;
+    int result;
+    u_long on;
+
+    on = 1;
+    result = ioctlsocket((SOCKET)s, FIONBIO, &on);
+    return result != 0;
 }

@@ -15,9 +15,9 @@
 
 static void check_public_api_signatures(void)
 {
-    void *(*app_ptr)(connection_t *) = connection_app_ptr;
-    uint8_t *(*remote_addr)(connection_t *) = connection_get_remote_addr;
-    void (*perf_stats)(connection_t *, rdp_connection_perf_stats_t *) = connection_get_perf_stats;
+    void **(*app_ptr)(connection_t *) = connection_app_ptr;
+    struct sockaddr *(*remote_addr)(connection_t *) = connection_get_remote_addr;
+    void (*perf_stats)(connection_t *, perf_stats_t *) = connection_get_perf_stats;
 
     (void)app_ptr;
     (void)remote_addr;
@@ -27,8 +27,8 @@ static void check_public_api_signatures(void)
 typedef struct close_thread_context_t
 {
     connection_t *connection;
-    int call_result;
-    int clean_result;
+    uint32_t call_result;
+    uint32_t clean_result;
 } close_thread_context_t;
 
 static int close_connection_thread(void *argument)
@@ -50,7 +50,7 @@ static void run_scenario(uint32_t create_flags)
     msg_arrival_t *client_message;
     close_thread_context_t client_close;
     thrd_t client_close_thread;
-    int server_close_result;
+    uint32_t server_close_result;
     int thread_result;
     uint32_t index;
 
@@ -60,11 +60,11 @@ static void run_scenario(uint32_t create_flags)
     }
 
     assert(rdp_create(&server, 0, 8, create_flags) == 0);
-    assert(rdp_create(&conflict, (uint16_t)(((uint16_t)server->ipv4_address[2] << 8) | server->ipv4_address[3]), 1, RDP_CREATE_REQUIRE_IPV4) == 11);
+    assert(rdp_create(&conflict, ntohs(server->local_udp_addr.sin_port), 1, RDP_CREATE_REQUIRE_IPV4) == 11);
     assert(conflict == NULL);
     assert(rdp_create(&client, 0, 1, create_flags) == 0);
-    assert(server->ipv4_address[2] != 0 || server->ipv4_address[3] != 0);
-    assert(rdp_connect(client, &client_connection, "127.0.0.1", (uint16_t)(((uint16_t)server->ipv4_address[2] << 8) | server->ipv4_address[3]), 0) == 0);
+    assert(server->local_udp_addr.sin_port != 0);
+    assert(rdp_connect(client, &client_connection, "127.0.0.1", ntohs(server->local_udp_addr.sin_port), 0) == 0);
     assert(connection_set_max_data_rate(client_connection, 64000) == 3000);
     connection_set_send_buffer_size(client_connection, 262144);
     assert(connection_send(client_connection, payload, sizeof(payload), 1, RDP_SEND_RELIABLE) == 0);
@@ -106,7 +106,7 @@ static void run_scenario(uint32_t create_flags)
 
 int main(void)
 {
-    static rdp_global_statistics_t statistics;
+    static rdp_stat statistics;
 #ifdef _MSC_VER
     _CrtSetReportMode(_CRT_ASSERT, _CRTDBG_MODE_FILE);
     _CrtSetReportFile(_CRT_ASSERT, _CRTDBG_FILE_STDERR);

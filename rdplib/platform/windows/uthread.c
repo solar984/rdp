@@ -1,68 +1,102 @@
 // Copyright (c) 2026 solar@heliacal.net
 // SPDX-License-Identifier: MIT
 
-#include "rdplib_platform.h"
+#include "uthread.h"
+
+#ifdef RDPLIB_DEBUG
+#include <assert.h>
+#include "dpf.h"
+#endif
 
 #include <process.h>
-#include <stdlib.h>
+#include <windows.h>
 
-typedef struct rdplib_platform_thread_record_t
+uint32_t uthread_wait_exit_code(uthread_t *thread, uint32_t *exit_code)
 {
-    HANDLE handle;
-    rdplib_platform_thread_entry_t entry;
-    void *argument;
-} rdplib_platform_thread_record_t;
+    int32_t result;
+    DWORD dwResult;
+    DWORD long_code;
 
-static unsigned __stdcall rdplib_platform_thread_start(void *argument)
-{
-    rdplib_platform_thread_record_t *thread = (rdplib_platform_thread_record_t *)argument;
-    rdplib_platform_thread_entry_t entry = thread->entry;
-    void *entry_argument = thread->argument;
-    return (unsigned)entry(entry_argument);
+    if (thread->handle == NULL)
+    {
+        *exit_code = UINT32_MAX;
+        result = 0;
+    }
+    else
+    {
+        dwResult = WaitForSingleObject((HANDLE)thread->handle, INFINITE);
+#ifdef RDPLIB_DEBUG
+        assert(dwResult != WAIT_FAILED);
+#endif
+        (void)dwResult;
+        result = (int32_t)GetExitCodeThread((HANDLE)thread->handle, &long_code) - 1;
+        *exit_code = (uint32_t)long_code;
+    }
+
+    if (result != 0)
+    {
+#ifdef RDPLIB_DEBUG
+        if (GetLastError() == STILL_ACTIVE)
+        {
+            dpf(0x20u, "GetLastError() == STILL_ACTIVE\n");
+        }
+#elif defined(RDPLIB_SOURCE_FAITHFUL)
+        (void)GetLastError();
+#endif
+    }
+    else if (*exit_code == STILL_ACTIVE)
+    {
+#ifdef RDPLIB_DEBUG
+        dpf(0x20u, "*exit_code == STILL_ACTIVE\n");
+#endif
+        result = -1;
+    }
+
+    return (uint32_t)result;
 }
 
-int rdplib_platform_thread_create(void **thread_output, rdplib_platform_thread_entry_t entry, void *argument)
+void uthread_init(uthread_t *thread)
 {
-    rdplib_platform_thread_record_t *thread = (rdplib_platform_thread_record_t *)malloc(sizeof(*thread));
-    uintptr_t handle;
+    thread->handle = NULL;
+}
 
-    if (!thread)
+void uthread_destroy(uthread_t *thread)
+{
+    uint32_t closed;
+
+    if (thread->handle != NULL)
     {
-        return 2;
+        closed = (uint32_t)CloseHandle((HANDLE)thread->handle);
+#ifdef RDPLIB_DEBUG
+        assert(closed);
+#endif
+        (void)closed;
     }
-    thread->entry = entry;
-    thread->argument = argument;
-    handle = _beginthreadex(NULL, 0, rdplib_platform_thread_start, thread, 0, NULL);
-    if (!handle)
-    {
-        free(thread);
-        return 1;
-    }
-    thread->handle = (HANDLE)handle;
-    (void)SetThreadPriority(thread->handle, 2);
-    *thread_output = thread;
+}
+
+uint32_t RDP_STDCALL start_routine(void *data)
+{
+    uthread_t *thread;
+
+    thread = (uthread_t *)data;
+    thread->proc(thread->data);
     return 0;
 }
 
-void rdplib_platform_thread_wait(void *thread_pointer, uint32_t *exit_code)
+uint32_t uthread_create(uthread_t *thread, uthread_f proc, void *data)
 {
-    rdplib_platform_thread_record_t *thread = (rdplib_platform_thread_record_t *)thread_pointer;
-    DWORD code = 0;
+    int bSet;
 
-    (void)WaitForSingleObject(thread->handle, INFINITE);
-    (void)GetExitCodeThread(thread->handle, &code);
-    if (exit_code)
+    thread->proc = proc;
+    thread->data = data;
+    thread->handle = (void *)_beginthreadex(NULL, 0, start_routine, thread, 0, (unsigned int *)&thread->id);
+    if (thread->handle != NULL)
     {
-        *exit_code = (uint32_t)code;
+        bSet = SetThreadPriority((HANDLE)thread->handle, THREAD_PRIORITY_HIGHEST);
+#ifdef RDPLIB_DEBUG
+        assert(bSet);
+#endif
+        (void)bSet;
     }
-}
-
-void rdplib_platform_thread_destroy(void *thread_pointer)
-{
-    rdplib_platform_thread_record_t *thread = (rdplib_platform_thread_record_t *)thread_pointer;
-    if (thread)
-    {
-        (void)CloseHandle(thread->handle);
-        free(thread);
-    }
+    return thread->handle == NULL;
 }

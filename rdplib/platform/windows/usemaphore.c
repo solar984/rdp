@@ -1,34 +1,70 @@
 // Copyright (c) 2026 solar@heliacal.net
 // SPDX-License-Identifier: MIT
 
-#include "rdplib_platform.h"
+#include "usemaphore.h"
 
-void rdplib_platform_semaphore_init(rdplib_platform_semaphore_t *semaphore)
+#ifdef RDPLIB_DEBUG
+#include <assert.h>
+#endif
+
+void usemaphore_init(usemaphore_t *sem)
 {
-    semaphore->handle = NULL;
+    sem->semid = NULL;
 }
 
-int rdplib_platform_semaphore_create(rdplib_platform_semaphore_t *semaphore)
+void usemaphore_destroy(usemaphore_t *sem)
 {
-    semaphore->handle = CreateSemaphoreA(NULL, 0, LONG_MAX, NULL);
-    return semaphore->handle ? 0 : 3;
-}
+    int bClosed;
 
-void rdplib_platform_semaphore_destroy(rdplib_platform_semaphore_t *semaphore)
-{
-    if (semaphore->handle)
+    if (sem->semid != NULL)
     {
-        CloseHandle(semaphore->handle);
+        bClosed = CloseHandle(sem->semid);
+#ifdef RDPLIB_DEBUG
+        assert(bClosed);
+#else
+        (void)bClosed;
+#endif
     }
 }
 
-int rdplib_platform_semaphore_wait(rdplib_platform_semaphore_t *semaphore, int32_t timeout_ms)
+uint32_t usemaphore_create(usemaphore_t *sem)
 {
-    DWORD timeout = timeout_ms < 0 ? INFINITE : (DWORD)timeout_ms;
-    return WaitForSingleObject(semaphore->handle, timeout) == WAIT_OBJECT_0;
+    uint32_t result;
+
+    result = 0;
+    sem->semid = CreateSemaphoreA(NULL, 0, INT32_MAX, NULL);
+#ifdef RDPLIB_DEBUG
+    assert(sem->semid != NULL);
+#endif
+    if (sem->semid == NULL)
+    {
+        result = 3;
+    }
+    return result;
 }
 
-void rdplib_platform_semaphore_signal(rdplib_platform_semaphore_t *semaphore)
+uint32_t usemaphore_decrement(usemaphore_t *sem, uint32_t timeout)
 {
-    (void)ReleaseSemaphore(semaphore->handle, 1, NULL);
+    uint32_t allocated;
+    uint32_t result;
+
+    allocated = 0;
+    result = (uint32_t)WaitForSingleObjectEx(sem->semid, (DWORD)timeout, FALSE);
+    if (result == WAIT_OBJECT_0)
+    {
+        allocated = 1;
+    }
+    return allocated;
+}
+
+void usemaphore_increment(usemaphore_t *sem)
+{
+    int bReleased;
+
+    bReleased = ReleaseSemaphore(sem->semid, 1, NULL);
+#ifdef RDPLIB_DEBUG
+    assert(bReleased);
+#else
+    (void)bReleased;
+#endif
 }

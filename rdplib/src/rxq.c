@@ -1,29 +1,36 @@
 // Copyright (c) 2026 solar@heliacal.net
 // SPDX-License-Identifier: MIT
 
-#include "queue.h"
+#include "rxq.h"
 
+#ifdef RDPLIB_DEBUG
+#include "dpf.h"
+#endif
 #include "fast.h"
 
-uint32_t rxq_flush_all_messages(rdp_rxq_t *queue, struct connection_t *connection)
+uint32_t rxq_flush_all_messages(rxq_t *rxq, connection_t *c)
 {
-    uint32_t remaining = queue->messages.count;
-    uint32_t released = 0;
+    msg_arrival_t *msg;
+    int queue_size;
+    uint32_t removed;
 
-    while (remaining--)
+    removed = 0;
+    queue_size = list_get_size(&rxq->list);
+    while (queue_size--)
     {
-        msg_arrival_t *message = (msg_arrival_t *)list_remove_head(&queue->messages);
-
-        if (message->sender_connection == connection)
+        msg = rxq_remove_head(rxq);
+        if (msg->sender == c)
         {
-            ++released;
-            fast_free(message);
+            ++removed;
+#ifdef RDPLIB_DEBUG
+            dpf(0x20u, "connection 0x%08x: message discarded on close\n", (uint32_t)(uintptr_t)c);
+#endif
+            fast_free(msg);
         }
         else
         {
-            list_add_tail(&queue->messages, &message->link);
+            rxq_add_tail(rxq, msg);
         }
     }
-
-    return released;
+    return removed;
 }

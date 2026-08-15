@@ -1,52 +1,94 @@
 // Copyright (c) 2026 solar@heliacal.net
 // SPDX-License-Identifier: MIT
 
-#include "queue.h"
+#include "txq.h"
 
-#include "packet.h"
+#ifdef RDPLIB_DEBUG
+#include <assert.h>
+#include "dpf.h"
+#endif
+#ifdef RDP_DEAD_CODE
+#include "fast.h"
+#endif
 
-uint32_t txq_get_oldest_time_sent(rdp_txq_t *queue)
+// unused, retained for historical interest
+#ifdef RDP_DEAD_CODE
+void txq_destroy(txq_t *txq)
 {
-    uint32_t remaining = queue->messages.count;
-    msg_outgoing_t *message = (msg_outgoing_t *)queue->messages.head->value;
-    uint32_t oldest = message->first_sent_time_ms;
+    msg_outgoing_t *msg;
+    uint32_t item_count;
 
-    while (remaining--)
+    item_count = list_get_size(&txq->list);
+    while (item_count--)
     {
-        message = (msg_outgoing_t *)list_remove_head(&queue->messages);
-
-        // Signed subtraction preserves the client's ordering across the
-        // 32 bit millisecond clock rollover.
-        if ((int32_t)(oldest - message->first_sent_time_ms) > 0)
-        {
-            oldest = message->first_sent_time_ms;
-        }
-
-        list_add_tail(&queue->messages, &message->link);
+        msg = txq_remove_head(txq);
+#ifdef RDPLIB_DEBUG
+        dpf(0x20u, "message not acknowledged (%u)\n", msg->msgid);
+#endif
+        // The May 2002 routine subtracts the size a second time here. It is intentionally preserved only in this dead implementation.
+        txq->queue_size -= msg->size;
+        fast_free(msg);
     }
-
-    return oldest;
+#ifdef RDPLIB_DEBUG
+    assert(txq->queue_size == 0);
+#endif
+    list_destroy(&txq->list);
 }
+#endif
 
-msg_outgoing_t *txq_remove_msgid(rdp_txq_t *queue, uint16_t message_id)
+msg_outgoing_t *txq_remove_msgid(txq_t *txq, uint16_t msgid)
 {
-    uint32_t remaining = queue->messages.count;
-    msg_outgoing_t *removed = 0;
+    msg_outgoing_t *msg;
+    uint32_t item_count;
+    msg_outgoing_t *msg_removed;
 
-    while (remaining--)
+    msg_removed = NULL;
+#ifdef RDPLIB_DEBUG
+    dpf(2u, "removing msgid == %u\n", msgid);
+#endif
+    item_count = list_get_size(&txq->list);
+    while (item_count--)
     {
-        msg_outgoing_t *message = (msg_outgoing_t *)list_remove_head(&queue->messages);
+        msg = (msg_outgoing_t *)list_remove_head(&txq->list);
 
-        if (message->message_id == message_id)
+        if (msg->msgid == msgid)
         {
-            queue->queued_bytes -= message->serialized_bytes;
-            removed = message;
+#ifdef RDPLIB_DEBUG
+            assert(msg_removed == NULL);
+            dpf(2u, "removed msgid == %u\n", msg->msgid);
+#endif
+            txq->queue_size -= msg->size;
+            msg_removed = msg;
         }
         else
         {
-            list_add_tail(&queue->messages, &message->link);
+            list_add_tail(&txq->list, &msg->txq_link);
         }
     }
 
-    return removed;
+    return msg_removed;
+}
+
+uint32_t txq_get_oldest_time_sent(txq_t *txq)
+{
+    msg_outgoing_t *msg;
+    uint32_t item_count;
+    uint32_t oldest;
+
+    item_count = list_get_size(&txq->list);
+#ifdef RDPLIB_DEBUG
+    assert(item_count != 0);
+#endif
+    msg = (msg_outgoing_t *)list_peek_head(&txq->list);
+    oldest = msg->time_first_sent;
+    while (item_count--)
+    {
+        msg = (msg_outgoing_t *)list_remove_head(&txq->list);
+        if ((int32_t)(oldest - msg->time_first_sent) > 0)
+        {
+            oldest = msg->time_first_sent;
+        }
+        list_add_tail(&txq->list, &msg->txq_link);
+    }
+    return oldest;
 }

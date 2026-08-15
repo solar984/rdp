@@ -12,13 +12,6 @@
 #include <string.h>
 #include <ws2tcpip.h>
 
-enum
-{
-    RDPLIB_PLATFORM_IO_SOURCE_IPV4 = 1,
-    RDPLIB_PLATFORM_IO_SOURCE_LEGACY = 2,
-    RDPLIB_PLATFORM_IO_SOURCE_ICMP = 4
-};
-
 static uint32_t g_last_recorded_socket_error;
 static LONG g_random_fallback_counter;
 
@@ -113,12 +106,6 @@ void rdplib_platform_network_cleanup(void)
     (void)WSACleanup();
 }
 
-uint16_t rdplib_platform_next_serial_port(void)
-{
-    static uint16_t next_port;
-    return next_port++;
-}
-
 int rdplib_platform_protocol_number(const char *name, int fallback)
 {
     struct protoent *entry = getprotobyname(name);
@@ -196,7 +183,12 @@ void rdplib_platform_socket_close(intptr_t endpoint)
 
 int32_t rdplib_platform_send_datagram(intptr_t endpoint, const uint8_t *packet, uint32_t packet_bytes, const uint8_t destination[16])
 {
-    return sendto((SOCKET)endpoint, (const char *)packet, (int)packet_bytes, 0, (const struct sockaddr *)destination, 16);
+    return rdplib_platform_send_datagram_to(endpoint, packet, packet_bytes, destination, 16);
+}
+
+int32_t rdplib_platform_send_datagram_to(intptr_t endpoint, const uint8_t *packet, uint32_t packet_bytes, const void *destination, uint32_t destination_bytes)
+{
+    return sendto((SOCKET)endpoint, (const char *)packet, (int)packet_bytes, 0, (const struct sockaddr *)destination, (int)destination_bytes);
 }
 
 #ifndef RDPLIB_SOURCE_FAITHFUL
@@ -238,7 +230,7 @@ int32_t rdplib_platform_receive_datagram(intptr_t endpoint, uint8_t *packet, uin
     return -1;
 }
 
-int rdplib_platform_wait(intptr_t ipv4_socket, intptr_t legacy_socket, intptr_t icmp_socket, uint32_t enabled_sources, int infinite, uint32_t timeout_seconds, uint32_t timeout_microseconds,
+int rdplib_platform_wait(intptr_t ipv4_socket, intptr_t ipx_socket, intptr_t icmp_socket, uint32_t enabled_sources, int infinite, uint32_t timeout_seconds, uint32_t timeout_microseconds,
                          uint32_t *ready_sources)
 {
     fd_set read_set;
@@ -251,9 +243,9 @@ int rdplib_platform_wait(intptr_t ipv4_socket, intptr_t legacy_socket, intptr_t 
     {
         FD_SET((SOCKET)ipv4_socket, &read_set);
     }
-    if ((enabled_sources & RDPLIB_PLATFORM_IO_SOURCE_LEGACY) != 0)
+    if ((enabled_sources & RDPLIB_PLATFORM_IO_SOURCE_IPX) != 0)
     {
-        FD_SET((SOCKET)legacy_socket, &read_set);
+        FD_SET((SOCKET)ipx_socket, &read_set);
     }
     if ((enabled_sources & RDPLIB_PLATFORM_IO_SOURCE_ICMP) != 0)
     {
@@ -275,9 +267,9 @@ int rdplib_platform_wait(intptr_t ipv4_socket, intptr_t legacy_socket, intptr_t 
         {
             *ready_sources |= RDPLIB_PLATFORM_IO_SOURCE_IPV4;
         }
-        if ((enabled_sources & RDPLIB_PLATFORM_IO_SOURCE_LEGACY) != 0 && FD_ISSET((SOCKET)legacy_socket, &read_set))
+        if ((enabled_sources & RDPLIB_PLATFORM_IO_SOURCE_IPX) != 0 && FD_ISSET((SOCKET)ipx_socket, &read_set))
         {
-            *ready_sources |= RDPLIB_PLATFORM_IO_SOURCE_LEGACY;
+            *ready_sources |= RDPLIB_PLATFORM_IO_SOURCE_IPX;
         }
         if ((enabled_sources & RDPLIB_PLATFORM_IO_SOURCE_ICMP) != 0 && FD_ISSET((SOCKET)icmp_socket, &read_set))
         {
@@ -287,46 +279,18 @@ int rdplib_platform_wait(intptr_t ipv4_socket, intptr_t legacy_socket, intptr_t 
     return result;
 }
 
-void rdplib_platform_send_wakeup(intptr_t ipv4_socket, const uint8_t local_address[16], uint32_t token)
-{
-    uint8_t destination[16];
-
-    if (ipv4_socket == -1)
-    {
-        return;
-    }
-
-    memcpy(destination, local_address, sizeof(destination));
-    destination[4] = 127;
-    destination[5] = 0;
-    destination[6] = 0;
-    destination[7] = 1;
-    (void)rdplib_platform_send_datagram(ipv4_socket, (const uint8_t *)&token, sizeof(token), destination);
-}
-
-int rdplib_platform_reverse_ipv4(uint32_t address, char *name, uint32_t name_bytes)
-{
-    struct hostent *entry = gethostbyaddr((const char *)&address, sizeof(address), AF_INET);
-    if (!entry || !entry->h_name || name_bytes == 0)
-    {
-        return 0;
-    }
-    strncpy(name, entry->h_name, name_bytes - 1u);
-    name[name_bytes - 1u] = '\0';
-    return 1;
-}
-
 intptr_t rdplib_platform_serial_create_event(void)
 {
     return (intptr_t)CreateEventA(NULL, TRUE, FALSE, NULL);
 }
 
-void rdplib_platform_serial_close_event(intptr_t event)
+int rdplib_platform_serial_close_event(intptr_t event)
 {
     if (event)
     {
-        (void)CloseHandle((HANDLE)event);
+        return CloseHandle((HANDLE)event) != FALSE;
     }
+    return 0;
 }
 
 int rdplib_platform_serial_write(intptr_t endpoint, rdplib_platform_serial_async_t *async_state, const void *data, uint32_t bytes, uint32_t *bytes_written, uint32_t *error_code)
@@ -363,4 +327,9 @@ int rdplib_platform_serial_get_read_result(intptr_t endpoint, rdplib_platform_se
     *bytes_read = (uint32_t)read_bytes;
     *error_code = result ? 0 : (uint32_t)GetLastError();
     return result != FALSE;
+}
+
+uint32_t rdplib_platform_last_system_error(void)
+{
+    return (uint32_t)GetLastError();
 }

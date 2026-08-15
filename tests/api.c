@@ -10,6 +10,8 @@
 _Static_assert(RDPLIB_USE_ENCRYPTION == UINT32_C(0x80000000), "endpoint flags must retain their recovered uint32_t values");
 _Static_assert(RDP_CONNECTION_FEATURE_KEEPALIVE == UINT32_C(1), "keepalive must retain the recovered option bit");
 _Static_assert(RDPLIB_CONNECTION_SEND_BUFFER_FULL == 14, "normal API send results must expose the recovered transport value");
+_Static_assert(RDP_SEND_ERROR_TOO_BIG == 18, "the recovered too-big send result must retain its historical name and value");
+_Static_assert(RDPLIB_CONNECTION_SEND_PAYLOAD_TOO_LARGE == RDP_SEND_ERROR_TOO_BIG, "the maintained API name must map to the recovered result");
 _Static_assert(RDPLIB_DISCONNECT_REASON_CONNECTION_INACTIVITY == 0x00050000, "normal API disconnect reasons must expose the recovered value");
 _Static_assert(RDPLIB_STREAM_COUNT == 20, "normal API stream count must expose the recovered protocol limit");
 _Static_assert(RDPLIB_DEFAULT_KEEPALIVE_INTERVAL_MS == UINT32_C(10000), "the normal keepalive interval must start at the recovered value");

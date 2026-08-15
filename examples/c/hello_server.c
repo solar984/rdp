@@ -7,11 +7,11 @@
 
 #include "rdp.h"
 
-static rdp_global_statistics_t example_statistics;
+static rdp_stat example_statistics;
 
 static uint16_t raw_local_port(const rdp_t *owner)
 {
-    return (uint16_t)(((uint16_t)owner->ipv4_address[2] << 8) | owner->ipv4_address[3]);
+    return ntohs(owner->local_udp_addr.sin_port);
 }
 
 int main(int argc, char **argv)
@@ -54,7 +54,7 @@ int main(int argc, char **argv)
         }
         if (connection && msg_arrival_has_fin(message))
         {
-            int clean_close = 0;
+            uint32_t clean_close = 0;
             (void)connection_close_wait(connection, 10000, &clean_close);
             printf("peer close completed: %s\n", clean_close ? "clean" : "not clean");
             done = 1;

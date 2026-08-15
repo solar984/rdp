@@ -119,6 +119,8 @@ Only one runtime may be active in a process.  The recovered transport stores its
 
 Returns `RDPLIB_OK`, `RDPLIB_ERROR_INVALID_ARGUMENT`, or `RDPLIB_ERROR_OUT_OF_MEMORY`.
 
+`RDPLIB_ERROR_OUT_OF_MEMORY` covers allocation of the runtime object.  The initial fast allocator storage follows the recovered unchecked behavior, so failure there is not reported.
+
 On success, the application owns `*output`.  Release it with `rdplib_runtime_destroy` after every endpoint and popped message is gone.
 
 ### `rdplib_runtime_destroy`
@@ -189,6 +191,8 @@ int rdplib_endpoint_process(rdplib_endpoint_t *endpoint, int32_t timeout_ms);
 ```
 
 Waits for an arrival up to `timeout_ms`, then moves everything currently ready into the application queues.
+
+A `timeout_ms` value of 0 polls, a positive value waits up to that many milliseconds, and `-1` waits without a deadline.  Other negative values are unsupported.
 
 Call this from the application thread which owns the endpoint.  The function does not transfer ownership of the endpoint.
 
@@ -347,6 +351,8 @@ int rdplib_connection_send(
 Sends one contiguous application message.  Stream IDs are 0 through 19.  Stream 0 does not add application ordering.
 
 Use `RDPLIB_SEND_RELIABLE` or `RDPLIB_SEND_UNRELIABLE`.  A reliable message may contain up to 51,200 bytes and is split into 512 byte fragments.  An unreliable message may contain up to 512 bytes.
+
+A zero byte reliable send returns success without allocating an ID or sending a datagram.  A zero byte unreliable send sends an empty datagram, but normal receive handling does not deliver an application message for it.
 
 The first packet sent in each direction should be reliable.  It carries SYN and establishes the initial reliable ID.  The default build holds an unreliable message submitted before SYN and sends it after the first reliable message is acknowledged.
 

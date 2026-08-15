@@ -7,6 +7,8 @@
 
 #include "rdplib_platform.h"
 
+uint32_t disable_blocking(intptr_t s);
+
 #ifdef _MSC_VER
 #include <crtdbg.h>
 #include <stdlib.h>
@@ -78,7 +80,7 @@ int main(void)
     sender = create_bound_loopback(sender_address);
     first_receiver = create_bound_loopback(first_address);
     second_receiver = create_bound_loopback(second_address);
-    assert(rdplib_platform_socket_disable_blocking(sender) == 0);
+    assert(disable_blocking(sender) == 0u);
     assert(rdplib_platform_enable_icmp_errors(sender) == 0);
 
     rdplib_platform_socket_close(first_receiver);

@@ -1,36 +1,75 @@
 // Copyright (c) 2026 solar@heliacal.net
 // SPDX-License-Identifier: MIT
 
-#include "container.h"
+#include "cmp.h"
 
-int uint8_cmp(const void *left, const void *right)
+#include <stdint.h>
+
+#ifdef RDP_DEAD_CODE
+// unused, retained for historical interest
+int uint64_cmp(const void *uint64_1, const void *uint64_2)
 {
-    const uint8_t difference = (uint8_t)(*(const uint8_t *)left - *(const uint8_t *)right);
-    const int8_t signed_difference = (int8_t)difference;
+    int64_t diff;
+    int result = 0;
 
-    if (signed_difference > 0)
+    diff = (int64_t)(*(const uint64_t *)uint64_1 - *(const uint64_t *)uint64_2);
+    if (diff > 0)
     {
-        return 1;
+        result = 1;
     }
-    if (signed_difference < 0)
+    else if (diff < 0)
     {
-        return -1;
+        result = -1;
     }
-    return 0;
+    return result;
 }
 
-int uint16_cmp(const void *left, const void *right)
+// Used only by the dead code DPC queue.
+int uint32_cmp(const void *uint32_1, const void *uint32_2)
 {
-    const uint16_t difference = (uint16_t)(*(const uint16_t *)left - *(const uint16_t *)right);
-    const int16_t signed_difference = (int16_t)difference;
+    int32_t result;
 
-    if (signed_difference > 0)
+    result = (int32_t)(*(const uint32_t *)uint32_1 - *(const uint32_t *)uint32_2);
+    if (result > 0)
     {
-        return 1;
+        result = 1;
     }
-    if (signed_difference < 0)
+    else if (result < 0)
     {
-        return -1;
+        result = -1;
     }
-    return 0;
+    return result;
+}
+#endif
+
+int uint16_cmp(const void *uint16_1, const void *uint16_2)
+{
+    int16_t result;
+
+    result = (int16_t)(*(const uint16_t *)uint16_1 - *(const uint16_t *)uint16_2);
+    if (result > 0)
+    {
+        result = 1;
+    }
+    else if (result < 0)
+    {
+        result = -1;
+    }
+    return result;
+}
+
+int uint8_cmp(const void *uint8_1, const void *uint8_2)
+{
+    int8_t result;
+
+    result = (int8_t)(*(const uint8_t *)uint8_1 - *(const uint8_t *)uint8_2);
+    if (result > 0)
+    {
+        result = 1;
+    }
+    else if (result < 0)
+    {
+        result = -1;
+    }
+    return result;
 }

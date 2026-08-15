@@ -1,30 +1,49 @@
 // Copyright (c) 2026 solar@heliacal.net
 // SPDX-License-Identifier: MIT
 
-// _bandwidth_t -- byte rate queue model used by the transmit path.
-//
-// The 3 fields and the 12 byte layout are verified in the PPC, Intel,
-// and TAKP Windows instructions.
 #ifndef RDP_BANDWIDTH_H
 #define RDP_BANDWIDTH_H
 
 #include <stdint.h>
+
+#include "layout.h"
+
 typedef struct _bandwidth_t
 {
-    uint32_t queued_bytes;   // Virtual backlog drained at bytes_per_second.
-    uint32_t update_time_ms; // Millisecond clock sample of the last backlog update.
-    uint32_t bytes_per_second;
-} _bandwidth_t;
+    uint32_t queue_size; // Virtual backlog drained at bandwidth bytes per second.
+    uint32_t queue_time; // Millisecond clock sample of the last backlog update.
+    uint32_t bandwidth;
+    uint32_t autoadjust; // not used
+} bandwidth_t, *Pbandwidth_t;
+
+RDP_ASSERT_OFFSET(bandwidth_t, queue_size, 0x00);
+RDP_ASSERT_OFFSET(bandwidth_t, queue_time, 0x04);
+RDP_ASSERT_OFFSET(bandwidth_t, bandwidth, 0x08);
+RDP_ASSERT_OFFSET(bandwidth_t, autoadjust, 0x0C);
+RDP_STATIC_ASSERT(sizeof(bandwidth_t) == 0x10, "bandwidth_t must be 0x10 bytes");
 
 #ifdef __cplusplus
 extern "C"
 {
 #endif
 
-uint32_t bandwidth_init(_bandwidth_t *bandwidth);
-uint32_t bandwidth_get_queue_size(_bandwidth_t *bandwidth);
-uint32_t bandwidth_get_time_empty(const _bandwidth_t *bandwidth);
-uint32_t bandwidth_enqueue_bytes(_bandwidth_t *bandwidth, uint32_t byte_count);
+void bandwidth_init(bandwidth_t *bandwidth);
+void bandwidth_enqueue_bytes(bandwidth_t *bandwidth, uint32_t size);
+uint32_t bandwidth_get_queue_size(bandwidth_t *bandwidth);
+uint32_t bandwidth_get_time_empty(bandwidth_t *bandwidth);
+
+// unused, retained for historical interest
+#ifdef RDP_DEAD_CODE
+void bandwidth_set_queue_size(bandwidth_t *bandwidth, uint32_t size);
+uint32_t bandwidth_stepup(bandwidth_t *bandwidth);
+uint32_t bandwidth_stepdown(bandwidth_t *bandwidth);
+void bandwidth_set_send_speed(bandwidth_t *bandwidth, uint32_t speed);
+#endif
+
+static uint32_t bandwidth_get_send_speed(bandwidth_t *bandwidth)
+{
+    return bandwidth->bandwidth;
+}
 
 #ifdef __cplusplus
 }

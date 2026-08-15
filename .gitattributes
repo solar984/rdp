@@ -1,0 +1,7 @@
+# Store and check out text with LF on every platform.
+* text=auto eol=lf
+
+# Preserve native libraries exactly.
+*.dll binary
+*.so binary
+*.dylib binary

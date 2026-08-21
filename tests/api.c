@@ -16,6 +16,14 @@ _Static_assert(RDPLIB_DISCONNECT_REASON_CONNECTION_INACTIVITY == 0x00050000, "no
 _Static_assert(RDPLIB_STREAM_COUNT == 20, "normal API stream count must expose the recovered protocol limit");
 _Static_assert(RDPLIB_DEFAULT_KEEPALIVE_INTERVAL_MS == UINT32_C(10000), "the normal keepalive interval must start at the recovered value");
 _Static_assert(RDPLIB_PACKET_DROP_BOTH == (RDPLIB_PACKET_DROP_INBOUND | RDPLIB_PACKET_DROP_OUTBOUND), "packet drop directions must be usable as a mask");
+_Static_assert(RDPLIB_ERROR_PLATFORM == -6, "platform error must remain -6");
+_Static_assert(sizeof(rdplib_endpoint_options_t) == 3u * sizeof(uint32_t), "endpoint options must contain 3 uint32_t values");
+
+enum
+{
+    TEST_SOCKET_BUFFER_BYTES = 64u * 1024u,
+    TEST_RUNTIME_SOCKET_BUFFER_BYTES = 96u * 1024u
+};
 
 typedef struct packet_drop_state_t
 {
@@ -34,10 +42,20 @@ static int packet_drop_callback(void *context, rdplib_packet_drop_direction_t di
     return (state->drop_directions & (uint32_t)direction) != 0;
 }
 
+static int socket_buffer_satisfies_request(uint32_t actual_bytes, uint32_t requested_bytes)
+{
+#ifdef __linux__
+    return (uint64_t)actual_bytes >= 2u * (uint64_t)requested_bytes;
+#else
+    return actual_bytes >= requested_bytes;
+#endif
+}
+
 int main(void)
 {
     static const uint8_t payload[] = "zero-copy consumer message";
     rdplib_runtime_t *runtime = NULL;
+    rdplib_endpoint_t *default_endpoint = NULL;
     rdplib_endpoint_t *server = NULL;
     rdplib_endpoint_t *client = NULL;
     rdplib_connection_t *client_connection = NULL;
@@ -46,17 +64,75 @@ int main(void)
     rdplib_message_t *client_message;
     rdplib_connection_perf_stats_t statistics;
     rdplib_disconnect_info_t disconnect;
+    rdplib_endpoint_options_t endpoint_options;
+    uint32_t default_receive_socket_buffer_bytes;
+    uint32_t default_send_socket_buffer_bytes;
+    uint32_t receive_socket_buffer_bytes;
+    uint32_t send_socket_buffer_bytes;
     uint8_t remote_address[4];
     uint16_t remote_port;
     packet_drop_state_t packet_drop = {UINT32_C(0x52445054), RDPLIB_PACKET_DROP_OUTBOUND};
     int saw_fin = 0;
     int attempts;
 
+    memset(&endpoint_options, 0, sizeof(endpoint_options));
+    endpoint_options.structure_size = sizeof(endpoint_options);
+    endpoint_options.receive_socket_buffer_bytes = TEST_SOCKET_BUFFER_BYTES;
+    endpoint_options.send_socket_buffer_bytes = TEST_SOCKET_BUFFER_BYTES;
+
+    assert(rdplib_endpoint_create_ex(NULL, &server, 0, 8, RDPLIB_USE_CRC, &endpoint_options) == RDPLIB_ERROR_INVALID_ARGUMENT);
+    assert(server == NULL);
     assert(rdplib_runtime_create(&runtime, 1024u * 1024u) == RDPLIB_OK);
     assert(rdplib_endpoint_create(runtime, &server, 0, 8, RDP_CREATE_REQUIRE_IPV4) == RDPLIB_ERROR_INVALID_ARGUMENT);
     assert(server == NULL);
-    assert(rdplib_endpoint_create(runtime, &server, 0, 8, RDPLIB_USE_CRC) == RDPLIB_ENDPOINT_CREATE_OK);
+
+    endpoint_options.structure_size = sizeof(endpoint_options) - 1u;
+    assert(rdplib_endpoint_create_ex(runtime, &server, 0, 8, RDPLIB_USE_CRC, &endpoint_options) == RDPLIB_ERROR_INVALID_ARGUMENT);
+    assert(server == NULL);
+    endpoint_options.structure_size = sizeof(endpoint_options);
+    endpoint_options.receive_socket_buffer_bytes = UINT32_MAX;
+    assert(rdplib_endpoint_create_ex(runtime, &server, 0, 8, RDPLIB_USE_CRC, &endpoint_options) == RDPLIB_ERROR_INVALID_ARGUMENT);
+    assert(server == NULL);
+
+    endpoint_options.receive_socket_buffer_bytes = 0;
+    endpoint_options.send_socket_buffer_bytes = 0;
+    assert(rdplib_endpoint_create_ex(runtime, &default_endpoint, 0, 1, RDPLIB_USE_CRC, &endpoint_options) == RDPLIB_ENDPOINT_CREATE_OK);
+    assert(rdplib_endpoint_get_socket_receive_buffer_size(default_endpoint, &default_receive_socket_buffer_bytes) == RDPLIB_OK);
+    assert(rdplib_endpoint_get_socket_send_buffer_size(default_endpoint, &default_send_socket_buffer_bytes) == RDPLIB_OK);
+    assert(default_receive_socket_buffer_bytes != 0);
+    assert(default_send_socket_buffer_bytes != 0);
+    assert(rdplib_endpoint_destroy(default_endpoint) == RDPLIB_OK);
+    default_endpoint = NULL;
+
+    endpoint_options.receive_socket_buffer_bytes = TEST_SOCKET_BUFFER_BYTES;
+    endpoint_options.send_socket_buffer_bytes = TEST_SOCKET_BUFFER_BYTES;
+    assert(rdplib_endpoint_create_ex(runtime, &server, 0, 8, RDPLIB_USE_CRC, &endpoint_options) == RDPLIB_ENDPOINT_CREATE_OK);
+    assert(rdplib_endpoint_get_socket_receive_buffer_size(NULL, &receive_socket_buffer_bytes) == RDPLIB_ERROR_INVALID_ARGUMENT);
+    assert(rdplib_endpoint_get_socket_receive_buffer_size(server, NULL) == RDPLIB_ERROR_INVALID_ARGUMENT);
+    assert(rdplib_endpoint_get_socket_send_buffer_size(NULL, &send_socket_buffer_bytes) == RDPLIB_ERROR_INVALID_ARGUMENT);
+    assert(rdplib_endpoint_get_socket_send_buffer_size(server, NULL) == RDPLIB_ERROR_INVALID_ARGUMENT);
+    assert(rdplib_endpoint_get_socket_receive_buffer_size(server, &receive_socket_buffer_bytes) == RDPLIB_OK);
+    assert(rdplib_endpoint_get_socket_send_buffer_size(server, &send_socket_buffer_bytes) == RDPLIB_OK);
+    assert(socket_buffer_satisfies_request(receive_socket_buffer_bytes, TEST_SOCKET_BUFFER_BYTES));
+    assert(socket_buffer_satisfies_request(send_socket_buffer_bytes, TEST_SOCKET_BUFFER_BYTES));
+    assert(rdplib_endpoint_set_socket_receive_buffer_size(NULL, TEST_RUNTIME_SOCKET_BUFFER_BYTES) == RDPLIB_ERROR_INVALID_ARGUMENT);
+    assert(rdplib_endpoint_set_socket_receive_buffer_size(server, 0) == RDPLIB_ERROR_INVALID_ARGUMENT);
+    assert(rdplib_endpoint_set_socket_receive_buffer_size(server, UINT32_MAX) == RDPLIB_ERROR_INVALID_ARGUMENT);
+    assert(rdplib_endpoint_set_socket_send_buffer_size(NULL, TEST_RUNTIME_SOCKET_BUFFER_BYTES) == RDPLIB_ERROR_INVALID_ARGUMENT);
+    assert(rdplib_endpoint_set_socket_send_buffer_size(server, 0) == RDPLIB_ERROR_INVALID_ARGUMENT);
+    assert(rdplib_endpoint_set_socket_send_buffer_size(server, UINT32_MAX) == RDPLIB_ERROR_INVALID_ARGUMENT);
+    assert(rdplib_endpoint_set_socket_receive_buffer_size(server, TEST_RUNTIME_SOCKET_BUFFER_BYTES) == RDPLIB_OK);
+    assert(rdplib_endpoint_set_socket_send_buffer_size(server, TEST_RUNTIME_SOCKET_BUFFER_BYTES) == RDPLIB_OK);
+    assert(rdplib_endpoint_get_socket_receive_buffer_size(server, &receive_socket_buffer_bytes) == RDPLIB_OK);
+    assert(rdplib_endpoint_get_socket_send_buffer_size(server, &send_socket_buffer_bytes) == RDPLIB_OK);
+    assert(socket_buffer_satisfies_request(receive_socket_buffer_bytes, TEST_RUNTIME_SOCKET_BUFFER_BYTES));
+    assert(socket_buffer_satisfies_request(send_socket_buffer_bytes, TEST_RUNTIME_SOCKET_BUFFER_BYTES));
+
     assert(rdplib_endpoint_create(runtime, &client, 0, 1, RDPLIB_USE_CRC) == RDPLIB_ENDPOINT_CREATE_OK);
+    assert(rdplib_endpoint_get_socket_receive_buffer_size(client, &receive_socket_buffer_bytes) == RDPLIB_OK);
+    assert(rdplib_endpoint_get_socket_send_buffer_size(client, &send_socket_buffer_bytes) == RDPLIB_OK);
+    assert(receive_socket_buffer_bytes == default_receive_socket_buffer_bytes);
+    assert(send_socket_buffer_bytes == default_send_socket_buffer_bytes);
     assert(rdplib_connect(client, &client_connection, "127.0.0.1", rdplib_endpoint_local_port(server)) == RDPLIB_CONNECT_OK);
     assert(rdplib_connection_enable_keepalive(NULL) == RDPLIB_ERROR_INVALID_ARGUMENT);
     assert(rdplib_connection_enable_keepalive_with_interval(NULL, 500) == RDPLIB_ERROR_INVALID_ARGUMENT);

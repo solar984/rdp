@@ -11,6 +11,7 @@
 #if defined(RDPLIB_DEBUG) || defined(RDPLIB_SOURCE_FAITHFUL)
 #include <stdio.h>
 #endif
+#include <limits.h>
 #include <string.h>
 
 #include "crc.h"
@@ -164,6 +165,53 @@ int rdp_get_socket_sndbuf(rdp_t *rdp)
     return size;
 }
 #endif
+
+static int rdplib_rdp_set_socket_buffer_size(rdp_t *rdp, int option, uint32_t bytes)
+{
+    int value;
+
+    if (bytes > (uint32_t)INT_MAX)
+    {
+        return -1;
+    }
+    value = (int)bytes;
+    return rdplib_platform_socket_set_option(rdp->udp_socket, RDP_SOCKET_LEVEL, option, &value, sizeof(value));
+}
+
+static int rdplib_rdp_get_socket_buffer_size(const rdp_t *rdp, int option, uint32_t *bytes)
+{
+    uint32_t value_bytes;
+    int value;
+    int result;
+
+    value_bytes = sizeof(value);
+    result = rdplib_platform_socket_get_option(rdp->udp_socket, RDP_SOCKET_LEVEL, option, &value, &value_bytes);
+    if (result == 0 && value >= 0)
+    {
+        *bytes = (uint32_t)value;
+    }
+    return result == 0 && value >= 0 ? 0 : -1;
+}
+
+int rdplib_rdp_set_socket_receive_buffer_size(rdp_t *rdp, uint32_t bytes)
+{
+    return rdplib_rdp_set_socket_buffer_size(rdp, RDP_SOCKET_RECEIVE_BUFFER, bytes);
+}
+
+int rdplib_rdp_set_socket_send_buffer_size(rdp_t *rdp, uint32_t bytes)
+{
+    return rdplib_rdp_set_socket_buffer_size(rdp, RDP_SOCKET_SEND_BUFFER, bytes);
+}
+
+int rdplib_rdp_get_socket_receive_buffer_size(const rdp_t *rdp, uint32_t *bytes)
+{
+    return rdplib_rdp_get_socket_buffer_size(rdp, RDP_SOCKET_RECEIVE_BUFFER, bytes);
+}
+
+int rdplib_rdp_get_socket_send_buffer_size(const rdp_t *rdp, uint32_t *bytes)
+{
+    return rdplib_rdp_get_socket_buffer_size(rdp, RDP_SOCKET_SEND_BUFFER, bytes);
+}
 
 void rdp_enqueue_arrival(rdp_t *rdp, msg_arrival_t *arrival)
 {
@@ -1099,7 +1147,19 @@ void rdp_init(rdp_t *rdp)
     rdp->last_sample = time_get_ms();
 }
 
+static uint32_t rdp_create_internal(rdp_t **out_rdp, uint16_t local_port, uint32_t connections, uint32_t flags, uint32_t receive_socket_buffer_bytes, uint32_t send_socket_buffer_bytes);
+
 uint32_t rdp_create(rdp_t **out_rdp, uint16_t local_port, uint32_t connections, uint32_t flags)
+{
+    return rdp_create_internal(out_rdp, local_port, connections, flags, 0, 0);
+}
+
+uint32_t rdplib_rdp_create(rdp_t **out_rdp, uint16_t local_port, uint32_t connections, uint32_t flags, uint32_t receive_socket_buffer_bytes, uint32_t send_socket_buffer_bytes)
+{
+    return rdp_create_internal(out_rdp, local_port, connections, flags, receive_socket_buffer_bytes, send_socket_buffer_bytes);
+}
+
+static uint32_t rdp_create_internal(rdp_t **out_rdp, uint16_t local_port, uint32_t connections, uint32_t flags, uint32_t receive_socket_buffer_bytes, uint32_t send_socket_buffer_bytes)
 {
     rdp_t *rdp;
     uint32_t namelen;
@@ -1199,6 +1259,22 @@ uint32_t rdp_create(rdp_t **out_rdp, uint16_t local_port, uint32_t connections, 
         {
             result = 1;
             goto exit;
+        }
+        if (receive_socket_buffer_bytes)
+        {
+            if (rdplib_rdp_set_socket_receive_buffer_size(rdp, receive_socket_buffer_bytes) != 0)
+            {
+                result = 1;
+                goto exit;
+            }
+        }
+        if (send_socket_buffer_bytes)
+        {
+            if (rdplib_rdp_set_socket_send_buffer_size(rdp, send_socket_buffer_bytes) != 0)
+            {
+                result = 1;
+                goto exit;
+            }
         }
         result = disable_blocking(rdp->udp_socket);
         if (result)

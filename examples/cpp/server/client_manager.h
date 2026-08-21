@@ -31,6 +31,8 @@ private:
     static constexpr std::uint32_t MaximumClientAcceptsPerTick = 5;
     static constexpr std::uint32_t ClientDataRate = 400u * 1024u;
     static constexpr std::uint32_t ClientSendBufferSize = 1024u * 1024u;
+    static constexpr std::uint32_t ReceiveSocketBufferSize = 1024u * 1024u;
+    static constexpr std::uint32_t SendSocketBufferSize = 1024u * 1024u;
 
     bool AcceptClients();
 

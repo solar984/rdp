@@ -24,6 +24,8 @@ public:
     // expected_connections selects the internal hash layout.  It is not a
     // connection limit.
     int Open(RDPRuntime &runtime, std::uint16_t local_port, std::uint32_t expected_connections = 100, std::uint32_t flags = RDPLIB_USE_CRC);
+    int Open(RDPRuntime &runtime, std::uint16_t local_port, const rdplib_endpoint_options_t &options, std::uint32_t expected_connections = 100,
+             std::uint32_t flags = RDPLIB_USE_CRC);
     int Close();
 
     int Process(std::int32_t timeout_ms = 0);
@@ -33,6 +35,10 @@ public:
     std::unique_ptr<RDPConnection> Connect(const char *host, std::uint16_t port, int *result = nullptr);
 
     std::uint16_t LocalPort() const;
+    int SetSocketReceiveBufferSize(std::uint32_t bytes);
+    int SetSocketSendBufferSize(std::uint32_t bytes);
+    int GetSocketReceiveBufferSize(std::uint32_t &bytes) const;
+    int GetSocketSendBufferSize(std::uint32_t &bytes) const;
 
 private:
     std::unique_ptr<RDPConnection> WrapConnection(rdplib_connection_t *connection, int *result);

@@ -4,10 +4,12 @@
 #include "rdplib.h"
 
 #include <assert.h>
+#include <limits.h>
 #include <stddef.h>
 #include <string.h>
 
 #include "rdp.h"
+#include "rdplib_rdp.h"
 
 struct rdplib_runtime_t
 {
@@ -366,7 +368,14 @@ int rdplib_runtime_destroy(rdplib_runtime_t *runtime)
 
 int rdplib_endpoint_create(rdplib_runtime_t *runtime, rdplib_endpoint_t **output, uint16_t local_port, uint32_t expected_connections, uint32_t flags)
 {
+    return rdplib_endpoint_create_ex(runtime, output, local_port, expected_connections, flags, NULL);
+}
+
+int rdplib_endpoint_create_ex(rdplib_runtime_t *runtime, rdplib_endpoint_t **output, uint16_t local_port, uint32_t expected_connections, uint32_t flags, const rdplib_endpoint_options_t *options)
+{
     rdplib_endpoint_t *endpoint;
+    uint32_t receive_socket_buffer_bytes = 0;
+    uint32_t send_socket_buffer_bytes = 0;
     int result;
 
     if (!runtime || runtime != rdplib_active_runtime || !output || (flags & ~(RDPLIB_USE_CRC | RDPLIB_USE_ENCRYPTION)) != 0)
@@ -374,6 +383,18 @@ int rdplib_endpoint_create(rdplib_runtime_t *runtime, rdplib_endpoint_t **output
         return RDPLIB_ERROR_INVALID_ARGUMENT;
     }
     *output = NULL;
+
+    if (options)
+    {
+        if (options->structure_size < sizeof(*options) ||
+            options->receive_socket_buffer_bytes > (uint32_t)INT_MAX ||
+            options->send_socket_buffer_bytes > (uint32_t)INT_MAX)
+        {
+            return RDPLIB_ERROR_INVALID_ARGUMENT;
+        }
+        receive_socket_buffer_bytes = options->receive_socket_buffer_bytes;
+        send_socket_buffer_bytes = options->send_socket_buffer_bytes;
+    }
 
     endpoint = (rdplib_endpoint_t *)rdplib_platform_malloc(sizeof(*endpoint));
     if (!endpoint)
@@ -383,7 +404,7 @@ int rdplib_endpoint_create(rdplib_runtime_t *runtime, rdplib_endpoint_t **output
     memset(endpoint, 0, sizeof(*endpoint));
     endpoint->runtime = runtime;
 
-    result = rdp_create(&endpoint->raw, local_port, expected_connections, flags | RDP_CREATE_REQUIRE_IPV4);
+    result = (int)rdplib_rdp_create(&endpoint->raw, local_port, expected_connections, flags | RDP_CREATE_REQUIRE_IPV4, receive_socket_buffer_bytes, send_socket_buffer_bytes);
     if (result != 0)
     {
         rdplib_platform_free(endpoint);
@@ -466,6 +487,42 @@ int rdplib_endpoint_destroy(rdplib_endpoint_t *endpoint)
 uint16_t rdplib_endpoint_local_port(const rdplib_endpoint_t *endpoint)
 {
     return endpoint && endpoint->raw ? ntohs(endpoint->raw->local_udp_addr.sin_port) : 0;
+}
+
+int rdplib_endpoint_set_socket_receive_buffer_size(rdplib_endpoint_t *endpoint, uint32_t bytes)
+{
+    if (!endpoint || !endpoint->raw || bytes == 0 || bytes > (uint32_t)INT_MAX)
+    {
+        return RDPLIB_ERROR_INVALID_ARGUMENT;
+    }
+    return rdplib_rdp_set_socket_receive_buffer_size(endpoint->raw, bytes) == 0 ? RDPLIB_OK : RDPLIB_ERROR_PLATFORM;
+}
+
+int rdplib_endpoint_set_socket_send_buffer_size(rdplib_endpoint_t *endpoint, uint32_t bytes)
+{
+    if (!endpoint || !endpoint->raw || bytes == 0 || bytes > (uint32_t)INT_MAX)
+    {
+        return RDPLIB_ERROR_INVALID_ARGUMENT;
+    }
+    return rdplib_rdp_set_socket_send_buffer_size(endpoint->raw, bytes) == 0 ? RDPLIB_OK : RDPLIB_ERROR_PLATFORM;
+}
+
+int rdplib_endpoint_get_socket_receive_buffer_size(const rdplib_endpoint_t *endpoint, uint32_t *bytes)
+{
+    if (!endpoint || !endpoint->raw || !bytes)
+    {
+        return RDPLIB_ERROR_INVALID_ARGUMENT;
+    }
+    return rdplib_rdp_get_socket_receive_buffer_size(endpoint->raw, bytes) == 0 ? RDPLIB_OK : RDPLIB_ERROR_PLATFORM;
+}
+
+int rdplib_endpoint_get_socket_send_buffer_size(const rdplib_endpoint_t *endpoint, uint32_t *bytes)
+{
+    if (!endpoint || !endpoint->raw || !bytes)
+    {
+        return RDPLIB_ERROR_INVALID_ARGUMENT;
+    }
+    return rdplib_rdp_get_socket_send_buffer_size(endpoint->raw, bytes) == 0 ? RDPLIB_OK : RDPLIB_ERROR_PLATFORM;
 }
 
 int rdplib_endpoint_process(rdplib_endpoint_t *endpoint, int32_t timeout_ms)

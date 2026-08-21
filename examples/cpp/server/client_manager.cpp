@@ -7,17 +7,49 @@
 #include <new>
 #include <utility>
 
+namespace
+{
+void LogSocketBuffer(const char *name, std::uint32_t requested_bytes, std::uint32_t actual_bytes)
+{
+    std::cout << "RDP " << name << " socket buffer requested " << requested_bytes << " bytes, operating system reported " << actual_bytes << " bytes\n";
+    if (actual_bytes >= requested_bytes)
+        return;
+
+    std::cerr << "warning: the operating system supplied less " << name << " socket buffer space than requested\n";
+    std::cerr << "if running on Linux, check net.core.rmem_max and net.core.wmem_max\n";
+}
+
+}
+
 int ClientManager::Open(std::uint16_t port)
 {
+    rdplib_endpoint_options_t endpoint_options{};
+    std::uint32_t receive_socket_buffer_bytes;
+    std::uint32_t send_socket_buffer_bytes;
+
     int result = m_runtime.Open();
     if (result != RDPLIB_OK)
         return result;
 
-    result = m_endpoint.Open(m_runtime, port);
-    if (result == RDPLIB_OK)
-        std::cout << "RDP server listening on UDP port " << m_endpoint.LocalPort() << '\n';
+    endpoint_options.structure_size = sizeof(endpoint_options);
+    endpoint_options.receive_socket_buffer_bytes = ReceiveSocketBufferSize;
+    endpoint_options.send_socket_buffer_bytes = SendSocketBufferSize;
+    result = m_endpoint.Open(m_runtime, port, endpoint_options);
+    if (result != RDPLIB_OK)
+        return result;
 
-    return result;
+    result = m_endpoint.GetSocketReceiveBufferSize(receive_socket_buffer_bytes);
+    if (result != RDPLIB_OK)
+        return result;
+    result = m_endpoint.GetSocketSendBufferSize(send_socket_buffer_bytes);
+    if (result != RDPLIB_OK)
+        return result;
+
+    LogSocketBuffer("receive", ReceiveSocketBufferSize, receive_socket_buffer_bytes);
+    LogSocketBuffer("send", SendSocketBufferSize, send_socket_buffer_bytes);
+    std::cout << "RDP server listening on UDP port " << m_endpoint.LocalPort() << '\n';
+
+    return RDPLIB_OK;
 }
 
 bool ClientManager::ProcessNetwork()

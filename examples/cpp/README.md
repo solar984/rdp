@@ -36,6 +36,8 @@ rdplib_cpp_client
 The server listens on UDP port `9000`, and the client connects to
 `127.0.0.1:9000`.  The programs do not take command line arguments.
 
+The server requests 1 MiB receive and send buffers for its UDP socket and logs the values reported by the operating system.  If a reported value is smaller than requested, the warning suggests checking `net.core.rmem_max` and `net.core.wmem_max` when running on Linux.  The server continues with the available value.  The client retains the operating system socket buffer defaults.
+
 The client performs this sequence:
 
 1. Send a reliable login request.

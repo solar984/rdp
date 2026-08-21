@@ -33,6 +33,13 @@ typedef struct rdplib_endpoint_t rdplib_endpoint_t;
 typedef struct rdplib_connection_t rdplib_connection_t;
 typedef struct rdplib_message_t rdplib_message_t;
 
+typedef struct rdplib_endpoint_options_t
+{
+    uint32_t structure_size;
+    uint32_t receive_socket_buffer_bytes;
+    uint32_t send_socket_buffer_bytes;
+} rdplib_endpoint_options_t;
+
 // Return nonzero to discard a connected RDP datagram as if it were lost.
 // The packet is borrowed and valid only during the callback.
 typedef int (*rdplib_packet_drop_callback_t)(void *context, rdplib_packet_drop_direction_t direction, const uint8_t *packet, uint32_t packet_bytes);
@@ -63,12 +70,20 @@ RDPLIB_API int rdplib_runtime_create(rdplib_runtime_t **output, uint32_t fast_al
 // Release every endpoint and original received message before the runtime.
 RDPLIB_API int rdplib_runtime_destroy(rdplib_runtime_t *runtime);
 
-// Normal endpoints are always IPv4.  Flags may contain RDPLIB_USE_CRC and RDPLIB_USE_ENCRYPTION.
+// Normal endpoints are always IPv4.  Flags may contain RDPLIB_USE_CRC and RDPLIB_USE_ENCRYPTION.  Socket buffers retain the operating system defaults.
 RDPLIB_API int rdplib_endpoint_create(rdplib_runtime_t *runtime, rdplib_endpoint_t **output, uint16_t local_port, uint32_t expected_connections, uint32_t flags);
+
+// Options may be null.  Set structure_size to sizeof(rdplib_endpoint_options_t).  A socket buffer value of 0 retains the operating system default.
+RDPLIB_API int rdplib_endpoint_create_ex(rdplib_runtime_t *runtime, rdplib_endpoint_t **output, uint16_t local_port, uint32_t expected_connections, uint32_t flags,
+                                         const rdplib_endpoint_options_t *options);
 
 // Use an endpoint and all of its connections from a single application thread.  Destroy returns busy until every application connection handle has been released.
 RDPLIB_API int rdplib_endpoint_destroy(rdplib_endpoint_t *endpoint);
 RDPLIB_API uint16_t rdplib_endpoint_local_port(const rdplib_endpoint_t *endpoint);
+RDPLIB_API int rdplib_endpoint_set_socket_receive_buffer_size(rdplib_endpoint_t *endpoint, uint32_t bytes);
+RDPLIB_API int rdplib_endpoint_set_socket_send_buffer_size(rdplib_endpoint_t *endpoint, uint32_t bytes);
+RDPLIB_API int rdplib_endpoint_get_socket_receive_buffer_size(const rdplib_endpoint_t *endpoint, uint32_t *bytes);
+RDPLIB_API int rdplib_endpoint_get_socket_send_buffer_size(const rdplib_endpoint_t *endpoint, uint32_t *bytes);
 
 // Wait for an arrival, then move everything currently ready to the application queues.
 RDPLIB_API int rdplib_endpoint_process(rdplib_endpoint_t *endpoint, int32_t timeout_ms);

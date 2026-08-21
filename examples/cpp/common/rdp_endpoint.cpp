@@ -47,6 +47,17 @@ int RDPEndpoint::Open(RDPRuntime &runtime, std::uint16_t local_port, std::uint32
     return rdplib_endpoint_create(runtime.m_runtime, &m_endpoint, local_port, expected_connections, flags);
 }
 
+int RDPEndpoint::Open(RDPRuntime &runtime, std::uint16_t local_port, const rdplib_endpoint_options_t &options, std::uint32_t expected_connections,
+                      std::uint32_t flags)
+{
+    if (m_endpoint != nullptr)
+        return RDPLIB_ERROR_BUSY;
+    if (!runtime.IsOpen())
+        return RDPLIB_ERROR_INVALID_ARGUMENT;
+
+    return rdplib_endpoint_create_ex(runtime.m_runtime, &m_endpoint, local_port, expected_connections, flags, &options);
+}
+
 int RDPEndpoint::Close()
 {
     if (m_endpoint == nullptr)
@@ -115,6 +126,26 @@ std::unique_ptr<RDPConnection> RDPEndpoint::Connect(const char *host, std::uint1
 std::uint16_t RDPEndpoint::LocalPort() const
 {
     return m_endpoint != nullptr ? rdplib_endpoint_local_port(m_endpoint) : 0;
+}
+
+int RDPEndpoint::SetSocketReceiveBufferSize(std::uint32_t bytes)
+{
+    return rdplib_endpoint_set_socket_receive_buffer_size(m_endpoint, bytes);
+}
+
+int RDPEndpoint::SetSocketSendBufferSize(std::uint32_t bytes)
+{
+    return rdplib_endpoint_set_socket_send_buffer_size(m_endpoint, bytes);
+}
+
+int RDPEndpoint::GetSocketReceiveBufferSize(std::uint32_t &bytes) const
+{
+    return rdplib_endpoint_get_socket_receive_buffer_size(m_endpoint, &bytes);
+}
+
+int RDPEndpoint::GetSocketSendBufferSize(std::uint32_t &bytes) const
+{
+    return rdplib_endpoint_get_socket_send_buffer_size(m_endpoint, &bytes);
 }
 
 std::unique_ptr<RDPConnection> RDPEndpoint::WrapConnection(rdplib_connection_t *connection, int *result)

@@ -14,7 +14,7 @@ Every function in the normal interface begins with `rdplib_`.
 | Area | Functions | Purpose |
 | --- | --- | --- |
 | Runtime | [`rdplib_runtime_create`](#rdplib_runtime_create), [`rdplib_runtime_destroy`](#rdplib_runtime_destroy) | Set up and release the process runtime. |
-| Endpoint | [`rdplib_endpoint_create`](#rdplib_endpoint_create), [`rdplib_endpoint_destroy`](#rdplib_endpoint_destroy), [`rdplib_endpoint_local_port`](#rdplib_endpoint_local_port), [`rdplib_endpoint_process`](#rdplib_endpoint_process) | Run a bidirectional UDP endpoint and move received data to the application. |
+| Endpoint | [`rdplib_endpoint_create`](#rdplib_endpoint_create), [`rdplib_endpoint_create_ex`](#rdplib_endpoint_create_ex), [`rdplib_endpoint_destroy`](#rdplib_endpoint_destroy), [`rdplib_endpoint_local_port`](#rdplib_endpoint_local_port), [`rdplib_endpoint_process`](#rdplib_endpoint_process) | Run a bidirectional UDP endpoint, configure its socket buffers, and move received data to the application. |
 | Accept and connect | [`rdplib_endpoint_accept`](#rdplib_endpoint_accept), [`rdplib_endpoint_pop_connectionless`](#rdplib_endpoint_pop_connectionless), [`rdplib_connect`](#rdplib_connect) | Accept connections, receive connectionless messages, or connect to a peer. |
 | Connection lifetime | [`rdplib_connection_release`](#rdplib_connection_release), [`rdplib_connection_is_usable`](#rdplib_connection_is_usable), [`rdplib_connection_begin_close`](#rdplib_connection_begin_close) | Check, close, and release a connection handle. |
 | Connection configuration | [`rdplib_connection_enable_keepalive`](#rdplib_connection_enable_keepalive), [`rdplib_connection_enable_keepalive_with_interval`](#rdplib_connection_enable_keepalive_with_interval), [`rdplib_connection_set_data_rate`](#rdplib_connection_set_data_rate), [`rdplib_connection_set_send_buffer_size`](#rdplib_connection_set_send_buffer_size) | Configure local connection behavior. |
@@ -61,7 +61,7 @@ Endpoint flags are fixed width macros.  The encryption bit is `UINT32_C(0x800000
 | Function family | Non error result | Error result |
 | --- | --- | --- |
 | Runtime, configuration, and status functions | `RDPLIB_OK` | Negative `RDPLIB_ERROR_*` |
-| `rdplib_endpoint_create` | `RDPLIB_ENDPOINT_CREATE_OK` | Negative wrapper errors or positive `RDPLIB_ENDPOINT_CREATE_*` results |
+| `rdplib_endpoint_create` and `rdplib_endpoint_create_ex` | `RDPLIB_ENDPOINT_CREATE_OK` | Negative wrapper errors or positive `RDPLIB_ENDPOINT_CREATE_*` results |
 | `rdplib_endpoint_destroy` | `RDPLIB_OK` | `RDPLIB_ERROR_BUSY` while an application connection handle remains |
 | `rdplib_connect` | `RDPLIB_CONNECT_OK` | Negative wrapper errors or positive `RDPLIB_CONNECT_*` results |
 | `rdplib_connection_send` | `RDPLIB_CONNECTION_SEND_OK` | Negative wrapper errors or positive `RDPLIB_CONNECTION_SEND_*` results |
@@ -70,6 +70,8 @@ Endpoint flags are fixed width macros.  The encryption bit is `UINT32_C(0x800000
 | Value and message accessors | The requested value, pointer, or boolean | 0 or null where documented |
 
 Send result 14 means the configured byte buffer is full.  Result 15 means there is no room for another reliable ID.  Neither result consumes the new message.  The application can try again after the transport has made progress.
+
+`RDPLIB_ERROR_PLATFORM` means an operating system socket option call failed.
 
 ## Ownership and threading
 
@@ -150,11 +152,33 @@ Creates an IPv4 UDP endpoint, its connection table and queues, and its I/O threa
 
 Set `local_port` to 0 to let the operating system choose a port.  `flags` may contain `RDPLIB_USE_CRC` and `RDPLIB_USE_ENCRYPTION`.
 
+This function retains the operating system receive and send socket buffer defaults.  It is equivalent to calling `rdplib_endpoint_create_ex` with null options.
+
 `expected_connections` is a recovered connection table sizing hint.  Use 1 for a single peer endpoint.  Any other value selects the normal larger table.
 
 Returns `RDPLIB_ENDPOINT_CREATE_OK`, a negative `RDPLIB_ERROR_*`, or a positive `RDPLIB_ENDPOINT_CREATE_*` result.
 
 On success, the application owns `*output`.  Destroy it with `rdplib_endpoint_destroy` after releasing every application owned connection.
+
+### `rdplib_endpoint_create_ex`
+
+```c
+int rdplib_endpoint_create_ex(
+    rdplib_runtime_t *runtime,
+    rdplib_endpoint_t **output,
+    uint16_t local_port,
+    uint32_t expected_connections,
+    uint32_t flags,
+    const rdplib_endpoint_options_t *options);
+```
+
+Creates the same IPv4 endpoint as `rdplib_endpoint_create` and can request receive and send buffer sizes for its UDP socket.
+
+Set `options->structure_size` to `sizeof(rdplib_endpoint_options_t)`.  A receive or send value of 0 retains the operating system default for that direction.  A null options pointer retains both defaults.
+
+Explicit buffer values must fit in a positive native `int`.  The options are applied after the socket is bound and before the I/O thread starts.  If an operating system call fails, creation fails and releases the partial endpoint.  An operating system may accept a request but provide a different value, so query the endpoint after creation when the effective value matters.
+
+Returns the same result set and ownership as `rdplib_endpoint_create`.
 
 ### `rdplib_endpoint_destroy`
 
@@ -183,6 +207,34 @@ Returns the endpoint's local UDP port.  This is useful after creating an endpoin
 Returns 0 for a null endpoint.
 
 The endpoint remains owned by the application.
+
+### Endpoint socket buffer configuration
+
+```c
+int rdplib_endpoint_set_socket_receive_buffer_size(
+    rdplib_endpoint_t *endpoint,
+    uint32_t bytes);
+
+int rdplib_endpoint_set_socket_send_buffer_size(
+    rdplib_endpoint_t *endpoint,
+    uint32_t bytes);
+
+int rdplib_endpoint_get_socket_receive_buffer_size(
+    const rdplib_endpoint_t *endpoint,
+    uint32_t *bytes);
+
+int rdplib_endpoint_get_socket_send_buffer_size(
+    const rdplib_endpoint_t *endpoint,
+    uint32_t *bytes);
+```
+
+The setters request a new `SO_RCVBUF` or `SO_SNDBUF` value on the endpoint's UDP socket.  A runtime request must be greater than 0 and fit in a positive native `int`.  These calls do not change any per connection RDP queue.
+
+The getters return the native value reported by `getsockopt`.  Windows can accept a request but return less than the requested value.  Linux doubles an explicit request for bookkeeping and returns that doubled value.  For example, a satisfied 1 MiB Linux request is normally reported as 2 MiB.  Linux limits unprivileged requests with `net.core.rmem_max` and `net.core.wmem_max`.
+
+The operating system may cap a request without making `setsockopt` fail.  Applications which require a minimum should call the matching getter and inspect its value.
+
+Returns `RDPLIB_OK`, `RDPLIB_ERROR_INVALID_ARGUMENT`, or `RDPLIB_ERROR_PLATFORM`.  The endpoint remains owned by the application.
 
 ### `rdplib_endpoint_process`
 

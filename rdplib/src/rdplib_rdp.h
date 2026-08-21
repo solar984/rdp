@@ -18,6 +18,13 @@ extern "C"
 // Host error adapter. This is intentionally not part of the recovered raw API.
 void rdplib_rdp_handle_reported_icmp(rdp_t *rdp, struct sockaddr *remote_addr, uint8_t type, uint8_t code, uint8_t trace_response, uint8_t trace_sample, struct sockaddr_in *source_addr);
 
+// Normal API creation entry point. This is intentionally not part of the recovered raw API.
+uint32_t rdplib_rdp_create(rdp_t **out_rdp, uint16_t local_port, uint32_t connections, uint32_t flags, uint32_t receive_socket_buffer_bytes, uint32_t send_socket_buffer_bytes);
+int rdplib_rdp_set_socket_receive_buffer_size(rdp_t *rdp, uint32_t bytes);
+int rdplib_rdp_set_socket_send_buffer_size(rdp_t *rdp, uint32_t bytes);
+int rdplib_rdp_get_socket_receive_buffer_size(const rdp_t *rdp, uint32_t *bytes);
+int rdplib_rdp_get_socket_send_buffer_size(const rdp_t *rdp, uint32_t *bytes);
+
 #ifdef __cplusplus
 }
 #endif

@@ -12,6 +12,7 @@ RDP is the historical name of this game transport.  It is not related to Microso
 - Fragmentation, reassembly, cumulative and selective acknowledgements, retransmission, rate control, and flow control.
 - Keepalive with a per connection interval, timeout detection, connection statistics, and nonblocking close with an application selected linger period.
 - ICMP port unreachable handling with exact peer attribution on supported Windows and Linux hosts.
+- Optional endpoint receive and send socket buffer tuning with effective value queries.
 - An optional per connection packet drop callback for application controlled loss testing.
 - IPv4 support on Windows and POSIX systems.
 - Bounds and transport state checks are enabled by default, with a source faithful build available for compatibility research.

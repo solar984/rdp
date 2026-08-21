@@ -236,6 +236,12 @@ static uint32_t rdplib_platform_normalize_socket_error(int error)
     {
         return 10035;
     }
+#ifdef ENOBUFS
+    if (error == ENOBUFS)
+    {
+        return 10055;
+    }
+#endif
     return (uint32_t)error;
 }
 

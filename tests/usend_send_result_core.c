@@ -11,7 +11,8 @@
 
 enum
 {
-    TEST_WOULD_BLOCK = 10035
+    TEST_WOULD_BLOCK = 10035,
+    TEST_NO_BUFFER_SPACE = 10055
 };
 
 static int32_t test_send_result;
@@ -78,6 +79,15 @@ int main(void)
 
     reset_backend((int32_t)sizeof(payload) - 1, TEST_WOULD_BLOCK);
     assert(usend(123, &iov, 1, as_sockaddr(destination), 0, 0) == 5);
+    assert(test_send_calls == 1);
+    assert(test_error_calls == 1);
+
+    reset_backend(-1, TEST_NO_BUFFER_SPACE);
+#ifdef RDPLIB_SOURCE_FAITHFUL
+    assert(usend(123, &iov, 1, as_sockaddr(destination), 0, 0) == 1);
+#else
+    assert(usend(123, &iov, 1, as_sockaddr(destination), 0, 0) == 5);
+#endif
     assert(test_send_calls == 1);
     assert(test_error_calls == 1);
 

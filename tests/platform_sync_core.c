@@ -3,6 +3,11 @@
 
 #include <stdint.h>
 
+#ifndef _WIN32
+#include <errno.h>
+#endif
+
+#include "rdplib_platform.h"
 #include "test_assert.h"
 #include "uevent.h"
 #include "usemaphore.h"
@@ -58,9 +63,20 @@ static void test_semaphore(void)
     usemaphore_destroy(&sem);
 }
 
+static void test_no_buffer_space_error(void)
+{
+#ifdef _WIN32
+    WSASetLastError(WSAENOBUFS);
+#else
+    errno = ENOBUFS;
+#endif
+    assert(rdplib_platform_last_socket_error() == 10055);
+}
+
 int main(void)
 {
     test_event();
     test_semaphore();
+    test_no_buffer_space_error();
     return 0;
 }

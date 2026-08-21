@@ -22,9 +22,25 @@
 enum
 {
     RDP_USEND_WOULD_BLOCK = 10035,
+    RDP_USEND_NO_BUFFER_SPACE = 10055,
     RDP_USEND_INVALID_ARGUMENT = 6,
     RDP_USEND_CAPACITY_EXCEEDED = 18
 };
+
+static uint32_t rdplib_usend_socket_error_is_retryable(uint32_t error)
+{
+    if (error == RDP_USEND_WOULD_BLOCK)
+    {
+        return 1;
+    }
+#ifndef RDPLIB_SOURCE_FAITHFUL
+    if (error == RDP_USEND_NO_BUFFER_SPACE)
+    {
+        return 1;
+    }
+#endif
+    return 0;
+}
 
 #ifndef RDPLIB_SOURCE_FAITHFUL
 static uint32_t rdplib_usend_validate(iov_t *iov, uint32_t iov_len, struct sockaddr *remote_addr, uint32_t encrypt, uint32_t crc, uint32_t *buffer_size);
@@ -131,7 +147,7 @@ uint32_t usend(intptr_t socket, iov_t *iov, uint32_t iov_len, struct sockaddr *r
     char_sent = rdplib_platform_send_datagram(socket, (const uint8_t *)buffer, (uint32_t)buffer_size, (const uint8_t *)remote_addr);
     if (char_sent != buffer_size)
     {
-        if (rdplib_platform_last_socket_error() == RDP_USEND_WOULD_BLOCK)
+        if (rdplib_usend_socket_error_is_retryable(rdplib_platform_last_socket_error()))
         {
             result = 5;
         }
@@ -204,7 +220,7 @@ static uint32_t rdplib_usend_send_joined(intptr_t socket, char *buffer, int32_t 
     char_sent = rdplib_platform_send_datagram(socket, (const uint8_t *)buffer, (uint32_t)buffer_size, (const uint8_t *)remote_addr);
     if (char_sent != buffer_size)
     {
-        return rdplib_platform_last_socket_error() == RDP_USEND_WOULD_BLOCK ? 5u : 1u;
+        return rdplib_usend_socket_error_is_retryable(rdplib_platform_last_socket_error()) ? 5u : 1u;
     }
     return 0;
 }

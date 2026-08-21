@@ -458,8 +458,9 @@ Deadline tests allow work up to 10 ms early.  Operating system scheduling can al
 The source faithful sender clears the ACK report before the socket send result is known.  If the send returns retryable result 5, later reliable traffic or a retransmission has to generate another
 ACK.  The original code does not restore the report immediately.
 
-The default build restores the report and its original delayed ACK deadline after result 5.  It keeps the original 100 ms worth of bandwidth pressure, so the scheduler waits for the backend pacing
-deadline and then sends the same ACK on the next successful packet.  A packet which the backend accepted is unchanged.
+The default build also maps operating system buffer exhaustion to result 5.  This is `WSAENOBUFS` on Windows and `ENOBUFS` on POSIX.  It restores the report and its original delayed ACK deadline after
+result 5.  It keeps the original 100 ms worth of bandwidth pressure, so the scheduler waits for the backend pacing deadline and then sends the same ACK on the next successful packet.  A packet which
+the backend accepted is unchanged.  The source faithful build only maps `WSAEWOULDBLOCK` and its POSIX equivalent to result 5.
 
 ## Applying acknowledgements
 
@@ -618,7 +619,7 @@ On a successful UDP send it charges:
 + 28 bytes of assumed IPv4/UDP overhead
 ```
 
-The charge excludes the optional CRC and encryption padding expansion.  On a would block backend result, the model instead adds 100 ms worth of configured rate as pressure.
+The charge excludes the optional CRC and encryption padding expansion.  On a retryable socket pressure result, the model instead adds 100 ms worth of configured rate as pressure.
 
 A message can be sent immediately only while:
 

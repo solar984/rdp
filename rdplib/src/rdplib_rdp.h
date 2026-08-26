@@ -10,6 +10,12 @@
 
 typedef struct rdp_t rdp_t;
 
+typedef struct rdplib_rdp_input_rate_t
+{
+    uint32_t bytes_per_second;
+    uint32_t duplicate_bytes_per_second;
+} rdplib_rdp_input_rate_t;
+
 #ifdef __cplusplus
 extern "C"
 {
@@ -24,6 +30,7 @@ int rdplib_rdp_set_socket_receive_buffer_size(rdp_t *rdp, uint32_t bytes);
 int rdplib_rdp_set_socket_send_buffer_size(rdp_t *rdp, uint32_t bytes);
 int rdplib_rdp_get_socket_receive_buffer_size(const rdp_t *rdp, uint32_t *bytes);
 int rdplib_rdp_get_socket_send_buffer_size(const rdp_t *rdp, uint32_t *bytes);
+void rdplib_rdp_get_input_rate(rdp_t *rdp, rdplib_rdp_input_rate_t *input_rate);
 
 #ifdef __cplusplus
 }

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 #include "test_assert.h"
+#include <stddef.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -18,6 +19,15 @@ _Static_assert(RDPLIB_DEFAULT_KEEPALIVE_INTERVAL_MS == UINT32_C(10000), "the nor
 _Static_assert(RDPLIB_PACKET_DROP_BOTH == (RDPLIB_PACKET_DROP_INBOUND | RDPLIB_PACKET_DROP_OUTBOUND), "packet drop directions must be usable as a mask");
 _Static_assert(RDPLIB_ERROR_PLATFORM == -6, "platform error must remain -6");
 _Static_assert(sizeof(rdplib_endpoint_options_t) == 3u * sizeof(uint32_t), "endpoint options must contain 3 uint32_t values");
+_Static_assert(sizeof(rdplib_endpoint_input_rate_t) == 2u * sizeof(uint32_t), "endpoint input rate size");
+_Static_assert(offsetof(rdplib_endpoint_input_rate_t, bytes_per_second) == 0, "endpoint input rate prefix");
+_Static_assert(sizeof(rdplib_connection_counters_t) == 61u * sizeof(uint32_t), "connection counters size");
+_Static_assert(offsetof(rdplib_connection_counters_t, unreliable_packets_tx) == 0, "connection counters prefix");
+_Static_assert(offsetof(rdplib_connection_counters_t, icmp_unknown) + sizeof(uint32_t) == sizeof(rdplib_connection_counters_t), "connection counters tail");
+_Static_assert(_Generic(&rdplib_endpoint_get_input_rate, int (*)(const rdplib_endpoint_t *, rdplib_endpoint_input_rate_t *): 1, default: 0),
+               "rdplib_endpoint_get_input_rate signature");
+_Static_assert(_Generic(&rdplib_connection_get_counters, int (*)(rdplib_connection_t *, rdplib_connection_counters_t *): 1, default: 0),
+               "rdplib_connection_get_counters signature");
 
 enum
 {
@@ -63,8 +73,12 @@ int main(void)
     rdplib_message_t *server_message;
     rdplib_message_t *client_message;
     rdplib_connection_perf_stats_t statistics;
+    rdplib_connection_counters_t counters;
+    rdplib_connection_counters_t counters_before;
     rdplib_disconnect_info_t disconnect;
     rdplib_endpoint_options_t endpoint_options;
+    rdplib_endpoint_input_rate_t input_rate;
+    rdplib_endpoint_input_rate_t input_rate_before;
     uint32_t default_receive_socket_buffer_bytes;
     uint32_t default_send_socket_buffer_bytes;
     uint32_t receive_socket_buffer_bytes;
@@ -107,6 +121,19 @@ int main(void)
     endpoint_options.receive_socket_buffer_bytes = TEST_SOCKET_BUFFER_BYTES;
     endpoint_options.send_socket_buffer_bytes = TEST_SOCKET_BUFFER_BYTES;
     assert(rdplib_endpoint_create_ex(runtime, &server, 0, 8, RDPLIB_USE_CRC, &endpoint_options) == RDPLIB_ENDPOINT_CREATE_OK);
+
+    memset(&input_rate, 0x5A, sizeof(input_rate));
+    input_rate_before = input_rate;
+    assert(rdplib_endpoint_get_input_rate(NULL, &input_rate) == RDPLIB_ERROR_INVALID_ARGUMENT);
+    assert(memcmp(&input_rate, &input_rate_before, sizeof(input_rate)) == 0);
+    assert(rdplib_endpoint_get_input_rate(server, NULL) == RDPLIB_ERROR_INVALID_ARGUMENT);
+    memset(&input_rate, 0x5A, sizeof(input_rate));
+    assert(rdplib_endpoint_get_input_rate(server, &input_rate) == RDPLIB_OK);
+#ifndef RDPLIB_TEST_SOURCE_FAITHFUL
+    assert(input_rate.bytes_per_second == 0);
+#endif
+    assert(input_rate.duplicate_reliable_bytes_per_second == 0);
+
     assert(rdplib_endpoint_get_socket_receive_buffer_size(NULL, &receive_socket_buffer_bytes) == RDPLIB_ERROR_INVALID_ARGUMENT);
     assert(rdplib_endpoint_get_socket_receive_buffer_size(server, NULL) == RDPLIB_ERROR_INVALID_ARGUMENT);
     assert(rdplib_endpoint_get_socket_send_buffer_size(NULL, &send_socket_buffer_bytes) == RDPLIB_ERROR_INVALID_ARGUMENT);
@@ -202,6 +229,17 @@ int main(void)
     assert(memcmp(rdplib_message_data(client_message), payload, sizeof(payload)) == 0);
     rdplib_message_release(client_message);
 
+    memset(&counters, 0x5A, sizeof(counters));
+    counters_before = counters;
+    assert(rdplib_connection_get_counters(NULL, &counters) == RDPLIB_ERROR_INVALID_ARGUMENT);
+    assert(memcmp(&counters, &counters_before, sizeof(counters)) == 0);
+    assert(rdplib_connection_get_counters(client_connection, NULL) == RDPLIB_ERROR_INVALID_ARGUMENT);
+
+    memset(&counters, 0, sizeof(counters));
+    assert(rdplib_connection_get_counters(client_connection, &counters) == RDPLIB_OK);
+    assert(counters.reliable_packets_tx != 0 && counters.reliable_bytes_tx != 0);
+    assert(counters.reliable_packets_rx != 0 && counters.reliable_bytes_rx != 0);
+
     assert(rdplib_connection_get_perf_stats(client_connection, &statistics) == RDPLIB_OK);
     assert(rdplib_connection_get_disconnect_info(client_connection, &disconnect) == RDPLIB_OK);
     assert(disconnect.reason == 0);
@@ -214,6 +252,11 @@ int main(void)
     assert(rdplib_connection_set_packet_drop_callback(client_connection, packet_drop_callback, &packet_drop) == RDPLIB_OK);
 #endif
     assert(rdplib_connection_begin_close(client_connection, 1000) == RDPLIB_CONNECTION_SEND_OK);
+
+    memset(&counters, 0x5A, sizeof(counters));
+    counters_before = counters;
+    assert(rdplib_connection_get_counters(client_connection, &counters) == RDPLIB_ERROR_NOT_USABLE);
+    assert(memcmp(&counters, &counters_before, sizeof(counters)) == 0);
 #ifndef RDPLIB_TEST_SOURCE_FAITHFUL
     // Close must remove the callback before the application can release its context.  The FIN below also proves that outbound dropping is no longer active.
     packet_drop.marker = 0;
@@ -242,6 +285,8 @@ int main(void)
         }
     }
     assert(saw_fin);
+    memset(&counters, 0, sizeof(counters));
+    assert(rdplib_connection_get_counters(server_connection, &counters) == RDPLIB_OK);
     assert(rdplib_connection_enable_keepalive(server_connection) == RDPLIB_ERROR_NOT_USABLE);
     assert(rdplib_endpoint_destroy(client) == RDPLIB_ERROR_BUSY);
     assert(rdplib_endpoint_destroy(server) == RDPLIB_ERROR_BUSY);

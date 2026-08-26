@@ -14,13 +14,13 @@ Every function in the normal interface begins with `rdplib_`.
 | Area | Functions | Purpose |
 | --- | --- | --- |
 | Runtime | [`rdplib_runtime_create`](#rdplib_runtime_create), [`rdplib_runtime_destroy`](#rdplib_runtime_destroy) | Set up and release the process runtime. |
-| Endpoint | [`rdplib_endpoint_create`](#rdplib_endpoint_create), [`rdplib_endpoint_create_ex`](#rdplib_endpoint_create_ex), [`rdplib_endpoint_destroy`](#rdplib_endpoint_destroy), [`rdplib_endpoint_local_port`](#rdplib_endpoint_local_port), [`rdplib_endpoint_process`](#rdplib_endpoint_process) | Run a bidirectional UDP endpoint, configure its socket buffers, and move received data to the application. |
+| Endpoint | [`rdplib_endpoint_create`](#rdplib_endpoint_create), [`rdplib_endpoint_create_ex`](#rdplib_endpoint_create_ex), [`rdplib_endpoint_destroy`](#rdplib_endpoint_destroy), [`rdplib_endpoint_local_port`](#rdplib_endpoint_local_port), [`rdplib_endpoint_get_input_rate`](#rdplib_endpoint_get_input_rate), [`rdplib_endpoint_process`](#rdplib_endpoint_process) | Run a bidirectional UDP endpoint, inspect its input rate, configure its socket buffers, and move received data to the application. |
 | Accept and connect | [`rdplib_endpoint_accept`](#rdplib_endpoint_accept), [`rdplib_endpoint_pop_connectionless`](#rdplib_endpoint_pop_connectionless), [`rdplib_connect`](#rdplib_connect) | Accept connections, receive connectionless messages, or connect to a peer. |
 | Connection lifetime | [`rdplib_connection_release`](#rdplib_connection_release), [`rdplib_connection_is_usable`](#rdplib_connection_is_usable), [`rdplib_connection_begin_close`](#rdplib_connection_begin_close) | Check, close, and release a connection handle. |
 | Connection configuration | [`rdplib_connection_enable_keepalive`](#rdplib_connection_enable_keepalive), [`rdplib_connection_enable_keepalive_with_interval`](#rdplib_connection_enable_keepalive_with_interval), [`rdplib_connection_set_data_rate`](#rdplib_connection_set_data_rate), [`rdplib_connection_set_send_buffer_size`](#rdplib_connection_set_send_buffer_size) | Configure local connection behavior. |
 | Connection testing | [`rdplib_connection_set_packet_drop_callback`](#rdplib_connection_set_packet_drop_callback) | Discard selected connected datagrams for testing. |
 | Connection I/O | [`rdplib_connection_send`](#rdplib_connection_send), [`rdplib_connection_pop_message`](#rdplib_connection_pop_message) | Send and receive application messages. |
-| Connection inspection | [`rdplib_connection_get_remote_ipv4`](#rdplib_connection_get_remote_ipv4), [`rdplib_connection_get_perf_stats`](#rdplib_connection_get_perf_stats), [`rdplib_connection_get_disconnect_info`](#rdplib_connection_get_disconnect_info) | Copy address, performance, and disconnect information. |
+| Connection inspection | [`rdplib_connection_get_remote_ipv4`](#rdplib_connection_get_remote_ipv4), [`rdplib_connection_get_counters`](#rdplib_connection_get_counters), [`rdplib_connection_get_perf_stats`](#rdplib_connection_get_perf_stats), [`rdplib_connection_get_disconnect_info`](#rdplib_connection_get_disconnect_info) | Copy address, traffic counters, performance, and disconnect information. |
 | Message inspection | [`rdplib_message_flags`](#rdplib_message_flags), [`rdplib_message_stream`](#rdplib_message_stream), [`rdplib_message_size`](#rdplib_message_size), [`rdplib_message_data`](#rdplib_message_data), [`rdplib_message_is_connectionless`](#rdplib_message_is_connectionless), [`rdplib_message_is_disconnect`](#rdplib_message_is_disconnect), [`rdplib_message_has_fin`](#rdplib_message_has_fin), [`rdplib_message_get_sender_ipv4`](#rdplib_message_get_sender_ipv4) | Inspect an owned message without changing it. |
 | Message lifetime | [`rdplib_message_release`](#rdplib_message_release) | Release an owned message. |
 
@@ -235,6 +235,22 @@ The getters return the native value reported by `getsockopt`.  Windows can accep
 The operating system may cap a request without making `setsockopt` fail.  Applications which require a minimum should call the matching getter and inspect its value.
 
 Returns `RDPLIB_OK`, `RDPLIB_ERROR_INVALID_ARGUMENT`, or `RDPLIB_ERROR_PLATFORM`.  The endpoint remains owned by the application.
+
+### `rdplib_endpoint_get_input_rate`
+
+```c
+int rdplib_endpoint_get_input_rate(
+    const rdplib_endpoint_t *endpoint,
+    rdplib_endpoint_input_rate_t *input_rate);
+```
+
+Copies the endpoint's latest completed input-rate sample.  `bytes_per_second` is the recovered endpoint-wide input accounting, not application payload throughput.  Each counted UDP datagram contributes its length plus the transport's fixed 28 byte IPv4 and UDP overhead estimate.  Datagrams rejected before accounting, including receives shorter than two bytes and the transport's internal loopback wakeup, are excluded.  The separate raw-ICMP receive path uses the same accounting when present.  `duplicate_reliable_bytes_per_second` is the subset attributed to duplicate reliable message IDs.  Do not add the duplicate value to the total.
+
+At the end of an I/O-loop pass, the thread publishes a new sample if more than one second has elapsed since the previous sample.  An idle endpoint can therefore retain an older sample until the I/O loop wakes.  Querying it does not force a sample or maintain a high water mark.  The two values are copied from one coherent sample.
+
+The interval accumulators and published values are `uint32_t` and wrap naturally.  The maintained profile widens the multiplication by 1000 during the rate calculation before narrowing the result; the source faithful profile retains the recovered 32-bit intermediate overflow behavior.  A source faithful endpoint also retains the recovered uninitialized first total-rate value until the first sample is published.
+
+Returns `RDPLIB_OK` or `RDPLIB_ERROR_INVALID_ARGUMENT`.  Invalid calls leave the output unchanged, the caller owns the output, and the endpoint remains owned by the application.
 
 ### `rdplib_endpoint_process`
 
@@ -476,6 +492,26 @@ Copies the remote IPv4 address in display order and returns the host order port.
 The address is cached in the wrapper, so this remains available after the transport has ended.
 
 Returns `RDPLIB_OK` or `RDPLIB_ERROR_INVALID_ARGUMENT`.  The output buffers belong to the caller and the connection remains owned by the application.
+
+### `rdplib_connection_get_counters`
+
+```c
+int rdplib_connection_get_counters(
+    rdplib_connection_t *connection,
+    rdplib_connection_counters_t *counters);
+```
+
+Copies a locked snapshot of the connection's cumulative traffic, acknowledgement, sequencing, discard, RTT-update, and ICMP counters.
+
+The public names use reliable and unreliable terminology.  `reliable_packets_retransmitted` and `reliable_bytes_retransmitted` count additional transmission attempts and are separate from the original reliable transmit counters.  `duplicate_reliable_*` records duplicate reliable arrivals separately rather than including them in `reliable_*_rx`.  The ACK fields are orthogonal packet classifications and can overlap other packet groups; they are not byte totals.
+
+The byte counters preserve the recovered accounting and are not symmetric wire-byte totals.  Transmit data bytes include application payload plus serialized message-ID, fragment, and stream metadata when present.  They exclude the base and ACK header, CRC or encryption expansion, and IP or UDP overhead.  Transmit packet and retransmission counters count attempts, including packets discarded by the maintained profile's drop callback or rejected by the send backend.  Receive data bytes exclude the parsed RDP header, which `header_bytes_rx` records separately.  The in-sequence and out-of-sequence byte counters include both RDP header and data, but not IP or UDP overhead.  The ICMP arrays are indexed by ICMP code.
+
+Every exposed counter is `uint32_t` and wraps naturally.  The internal debug-only rolling `tqd_*` measurements are not exposed.
+
+The snapshot remains available after a peer FIN or transport failure because the raw connection remains attached until local close or release.  Read it before `rdplib_connection_begin_close` or `rdplib_connection_release`; afterward the wrapper no longer has a usable raw connection.
+
+Returns `RDPLIB_OK`, `RDPLIB_ERROR_INVALID_ARGUMENT`, or `RDPLIB_ERROR_NOT_USABLE`.  Errors leave the output unchanged, the caller owns the output, and the connection remains owned by the application.
 
 ### `rdplib_connection_get_perf_stats`
 

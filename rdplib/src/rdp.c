@@ -848,6 +848,8 @@ void rdp_io_thread(void *data)
     uint32_t current_time;
     uint32_t timeout;
     uint32_t elapsed_time;
+    uint32_t input_rate;
+    uint32_t duplicate_input_rate;
     connection_t *c;
     int32_t ready;
     int32_t max_timeout;
@@ -1040,11 +1042,20 @@ void rdp_io_thread(void *data)
         elapsed_time = current_time - rdp->last_sample;
         if (elapsed_time > 1000u)
         {
-            rdp->bytes_per_second = 1000u * rdp->bytes_recvd / elapsed_time;
-            rdp->duplicate_bytes_per_second = 1000u * rdp->duplicate_bytes_recvd / elapsed_time;
+#ifdef RDPLIB_SOURCE_FAITHFUL
+            input_rate = 1000u * rdp->bytes_recvd / elapsed_time;
+            duplicate_input_rate = 1000u * rdp->duplicate_bytes_recvd / elapsed_time;
+#else
+            input_rate = (uint32_t)(UINT64_C(1000) * rdp->bytes_recvd / elapsed_time);
+            duplicate_input_rate = (uint32_t)(UINT64_C(1000) * rdp->duplicate_bytes_recvd / elapsed_time);
+#endif
             rdp->bytes_recvd = 0;
             rdp->duplicate_bytes_recvd = 0;
+            umutex_lock(&rdp->message_rxq_mutex);
+            rdp->bytes_per_second = input_rate;
+            rdp->duplicate_bytes_per_second = duplicate_input_rate;
             rdp->last_sample = current_time;
+            umutex_unlock(&rdp->message_rxq_mutex);
         }
 
         max_time = time_get_ms();
@@ -1132,7 +1143,11 @@ void rdp_init(rdp_t *rdp)
     rdp->ipx_broadcast = 0;
     rdp->bytes_recvd = 0;
     rdp->duplicate_bytes_recvd = 0;
+#ifdef RDPLIB_SOURCE_FAITHFUL
     rdp->bytes_recvd = 0;
+#else
+    rdp->bytes_per_second = 0;
+#endif
     rdp->duplicate_bytes_per_second = 0;
     serial_init(&rdp->serial);
     connhash_init(&rdp->addr_map);
@@ -1982,16 +1997,38 @@ uint32_t rdp_get_transport_mask(void)
 }
 #endif
 
+void rdplib_rdp_get_input_rate(rdp_t *rdp, rdplib_rdp_input_rate_t *input_rate)
+{
+    umutex_lock(&rdp->message_rxq_mutex);
+    input_rate->bytes_per_second = rdp->bytes_per_second;
+    input_rate->duplicate_bytes_per_second = rdp->duplicate_bytes_per_second;
+    umutex_unlock(&rdp->message_rxq_mutex);
+}
+
 uint32_t rdp_get_input_rate(rdp_t *rdp)
 {
+#ifndef RDPLIB_SOURCE_FAITHFUL
+    rdplib_rdp_input_rate_t input_rate;
+
+    rdplib_rdp_get_input_rate(rdp, &input_rate);
+    return input_rate.bytes_per_second;
+#else
     return rdp->bytes_per_second;
+#endif
 }
 
 #ifdef RDP_DEAD_CODE
 // unused, retained for historical interest
 uint32_t rdp_get_duplicate_input_rate(rdp_t *rdp)
 {
+#ifndef RDPLIB_SOURCE_FAITHFUL
+    rdplib_rdp_input_rate_t input_rate;
+
+    rdplib_rdp_get_input_rate(rdp, &input_rate);
+    return input_rate.duplicate_bytes_per_second;
+#else
     return rdp->duplicate_bytes_per_second;
+#endif
 }
 #endif
 

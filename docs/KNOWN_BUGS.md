@@ -77,7 +77,7 @@ Application code should use [`rdplib_connection_begin_close`](API.md#rdplib_conn
 - Fast pool growth clears a new host allocation before checking it.  Allocation failure can become a null write.
 - `fast_free` trusts the private pool index stored immediately before the caller pointer.
 - The process global statistics pointer is used without null checks.
-- Statistics counters are updated under different connection locks.  They do not form a single atomic snapshot across every connection.
+- Process-global statistics counters are updated under different connection locks.  They do not form a single atomic snapshot across every connection.  The normal API's per-connection counter getter is a separate snapshot protected by that connection's lock.
 
 All maintained profiles clear new backing storage, matching the Mac clients.  The recovered Windows clients did not clear it.
 

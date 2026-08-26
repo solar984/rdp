@@ -10,7 +10,8 @@ RDP is the historical name of this game transport.  It is not related to Microso
 
 - Reliable and unreliable UDP messages with multiple logical streams.
 - Fragmentation, reassembly, cumulative and selective acknowledgements, retransmission, rate control, and flow control.
-- Keepalive with a per connection interval, timeout detection, connection statistics, and nonblocking close with an application selected linger period.
+- Keepalive with a per connection interval, timeout detection, locked connection counter and performance snapshots, and nonblocking close with an application selected linger period.
+- Endpoint-wide received-byte and duplicate-reliable-byte rate snapshots.
 - ICMP port unreachable handling with exact peer attribution on supported Windows and Linux hosts.
 - Optional endpoint receive and send socket buffer tuning with effective value queries.
 - An optional per connection packet drop callback for application controlled loss testing.

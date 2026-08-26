@@ -525,6 +525,20 @@ int rdplib_endpoint_get_socket_send_buffer_size(const rdplib_endpoint_t *endpoin
     return rdplib_rdp_get_socket_send_buffer_size(endpoint->raw, bytes) == 0 ? RDPLIB_OK : RDPLIB_ERROR_PLATFORM;
 }
 
+int rdplib_endpoint_get_input_rate(const rdplib_endpoint_t *endpoint, rdplib_endpoint_input_rate_t *input_rate)
+{
+    rdplib_rdp_input_rate_t raw;
+
+    if (!endpoint || !endpoint->raw || !input_rate)
+    {
+        return RDPLIB_ERROR_INVALID_ARGUMENT;
+    }
+    rdplib_rdp_get_input_rate(endpoint->raw, &raw);
+    input_rate->bytes_per_second = raw.bytes_per_second;
+    input_rate->duplicate_reliable_bytes_per_second = raw.duplicate_bytes_per_second;
+    return RDPLIB_OK;
+}
+
 int rdplib_endpoint_process(rdplib_endpoint_t *endpoint, int32_t timeout_ms)
 {
     msg_arrival_t *arrival;
@@ -892,6 +906,75 @@ int rdplib_connection_get_remote_ipv4(rdplib_connection_t *connection, uint8_t a
     }
     memcpy(endpoint, connection->remote_address, sizeof(endpoint));
     return rdplib_decode_ipv4_address(endpoint, address, port);
+}
+
+int rdplib_connection_get_counters(rdplib_connection_t *connection, rdplib_connection_counters_t *counters)
+{
+    connection_stat raw;
+    rdplib_connection_counters_t result;
+
+    if (!connection || !counters)
+    {
+        return RDPLIB_ERROR_INVALID_ARGUMENT;
+    }
+    if (!connection->raw)
+    {
+        return RDPLIB_ERROR_NOT_USABLE;
+    }
+
+    umutex_lock(&connection->raw->cn_lock);
+    memcpy(&raw, &connection->raw->stat, sizeof(raw));
+    umutex_unlock(&connection->raw->cn_lock);
+    memset(&result, 0, sizeof(result));
+#define COPY_COUNTER(public_name, raw_name) result.public_name = raw.raw_name
+    COPY_COUNTER(unreliable_packets_tx, best_effort_packets_tx);
+    COPY_COUNTER(unreliable_bytes_tx, best_effort_bytes_tx);
+    COPY_COUNTER(reliable_packets_tx, guaranteed_packets_tx);
+    COPY_COUNTER(reliable_bytes_tx, guaranteed_bytes_tx);
+    COPY_COUNTER(reliable_packets_retransmitted, guaranteed_packets_retx);
+    COPY_COUNTER(reliable_bytes_retransmitted, guaranteed_bytes_retx);
+    COPY_COUNTER(ack_only_packets_tx, ack_only_packets_tx);
+    COPY_COUNTER(ack_and_data_packets_tx, ack_and_data_packets_tx);
+    COPY_COUNTER(unreliable_packets_rx, best_effort_packets_rx);
+    COPY_COUNTER(unreliable_bytes_rx, best_effort_bytes_rx);
+    COPY_COUNTER(reliable_packets_rx, guaranteed_packets_rx);
+    COPY_COUNTER(reliable_bytes_rx, guaranteed_bytes_rx);
+    COPY_COUNTER(duplicate_reliable_packets_rx, duplicate_packets_rx);
+    COPY_COUNTER(duplicate_reliable_bytes_rx, duplicate_bytes_rx);
+    COPY_COUNTER(header_bytes_rx, header_bytes_rx);
+    COPY_COUNTER(ack_only_packets_rx, ack_only_packets_rx);
+    COPY_COUNTER(ack_and_data_packets_rx, ack_and_data_packets_rx);
+    COPY_COUNTER(messages_acked, messages_acked);
+    COPY_COUNTER(duplicate_acks, duplicate_acks);
+    COPY_COUNTER(bytes_in_duplicate_acks, bytes_in_duplicate_acks);
+    COPY_COUNTER(acks_for_unsent_messages, acks_for_unsent_messages);
+    COPY_COUNTER(packets_rx_in_sequence, packets_rx_in_sequence);
+    COPY_COUNTER(bytes_rx_in_sequence, bytes_rx_in_sequence);
+    COPY_COUNTER(packets_rx_out_of_sequence, packets_rx_out_of_sequence);
+    COPY_COUNTER(bytes_rx_out_of_sequence, bytes_rx_out_of_sequence);
+    COPY_COUNTER(discarded_bad_options, discarded_bad_options);
+    COPY_COUNTER(discarded_old_seqnum, discarded_old_seqnum);
+    COPY_COUNTER(discarded_dup_seqnum, discarded_dup_seqnum);
+    COPY_COUNTER(discarded_old_msgid, discarded_old_msgid);
+    COPY_COUNTER(discarded_bad_fragment, discarded_bad_fragment);
+    COPY_COUNTER(discarded_bad_stream, discarded_bad_stream);
+    COPY_COUNTER(discarded_too_short, discarded_too_short);
+    COPY_COUNTER(discarded_bad_fragment_size, discarded_bad_fragment_size);
+    COPY_COUNTER(discarded_bad_ack_header, discarded_bad_ack_header);
+    COPY_COUNTER(discarded_bad_ackmask, discarded_bad_ackmask);
+    COPY_COUNTER(discarded_mask_wo_ack, discarded_mask_wo_ack);
+    COPY_COUNTER(discarded_old_ack, discarded_old_ack);
+    COPY_COUNTER(packets_updated_rtt, packets_updated_rtt);
+    COPY_COUNTER(packets_updated_rtt_attempts, packets_updated_rtt_attempts);
+    COPY_COUNTER(icmp_source_quench, icmp_source_quench);
+    COPY_COUNTER(icmp_unknown, icmp_unknown);
+#undef COPY_COUNTER
+    memcpy(result.icmp_unreachable, raw.icmp_unreachable, sizeof(result.icmp_unreachable));
+    memcpy(result.icmp_ttl_expired, raw.icmp_ttl_expired, sizeof(result.icmp_ttl_expired));
+    memcpy(result.icmp_parameter_problem, raw.icmp_parameter_problem, sizeof(result.icmp_parameter_problem));
+
+    memcpy(counters, &result, sizeof(result));
+    return RDPLIB_OK;
 }
 
 int rdplib_connection_get_perf_stats(rdplib_connection_t *connection, rdplib_connection_perf_stats_t *statistics)

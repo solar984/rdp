@@ -40,6 +40,12 @@ typedef struct rdplib_endpoint_options_t
     uint32_t send_socket_buffer_bytes;
 } rdplib_endpoint_options_t;
 
+typedef struct rdplib_endpoint_input_rate_t
+{
+    uint32_t bytes_per_second;
+    uint32_t duplicate_reliable_bytes_per_second;
+} rdplib_endpoint_input_rate_t;
+
 // Return nonzero to discard a connected RDP datagram as if it were lost.
 // The packet is borrowed and valid only during the callback.
 typedef int (*rdplib_packet_drop_callback_t)(void *context, rdplib_packet_drop_direction_t direction, const uint8_t *packet, uint32_t packet_bytes);
@@ -55,6 +61,54 @@ typedef struct rdplib_connection_perf_stats_t
     uint32_t queued_reliable_bytes;
     uint32_t transmit_stall_time_ms;
 } rdplib_connection_perf_stats_t;
+
+typedef struct rdplib_connection_counters_t
+{
+    uint32_t unreliable_packets_tx;
+    uint32_t unreliable_bytes_tx;
+    uint32_t reliable_packets_tx;
+    uint32_t reliable_bytes_tx;
+    uint32_t reliable_packets_retransmitted;
+    uint32_t reliable_bytes_retransmitted;
+    uint32_t ack_only_packets_tx;
+    uint32_t ack_and_data_packets_tx;
+    uint32_t unreliable_packets_rx;
+    uint32_t unreliable_bytes_rx;
+    uint32_t reliable_packets_rx;
+    uint32_t reliable_bytes_rx;
+    uint32_t duplicate_reliable_packets_rx;
+    uint32_t duplicate_reliable_bytes_rx;
+    uint32_t header_bytes_rx;
+    uint32_t ack_only_packets_rx;
+    uint32_t ack_and_data_packets_rx;
+    uint32_t messages_acked;
+    uint32_t duplicate_acks;
+    uint32_t bytes_in_duplicate_acks;
+    uint32_t acks_for_unsent_messages;
+    uint32_t packets_rx_in_sequence;
+    uint32_t bytes_rx_in_sequence;
+    uint32_t packets_rx_out_of_sequence;
+    uint32_t bytes_rx_out_of_sequence;
+    uint32_t discarded_bad_options;
+    uint32_t discarded_old_seqnum;
+    uint32_t discarded_dup_seqnum;
+    uint32_t discarded_old_msgid;
+    uint32_t discarded_bad_fragment;
+    uint32_t discarded_bad_stream;
+    uint32_t discarded_too_short;
+    uint32_t discarded_bad_fragment_size;
+    uint32_t discarded_bad_ack_header;
+    uint32_t discarded_bad_ackmask;
+    uint32_t discarded_mask_wo_ack;
+    uint32_t discarded_old_ack;
+    uint32_t packets_updated_rtt;
+    uint32_t packets_updated_rtt_attempts;
+    uint32_t icmp_unreachable[16];
+    uint32_t icmp_source_quench;
+    uint32_t icmp_ttl_expired[2];
+    uint32_t icmp_parameter_problem[2];
+    uint32_t icmp_unknown;
+} rdplib_connection_counters_t;
 
 typedef struct rdplib_disconnect_info_t
 {
@@ -84,6 +138,8 @@ RDPLIB_API int rdplib_endpoint_set_socket_receive_buffer_size(rdplib_endpoint_t 
 RDPLIB_API int rdplib_endpoint_set_socket_send_buffer_size(rdplib_endpoint_t *endpoint, uint32_t bytes);
 RDPLIB_API int rdplib_endpoint_get_socket_receive_buffer_size(const rdplib_endpoint_t *endpoint, uint32_t *bytes);
 RDPLIB_API int rdplib_endpoint_get_socket_send_buffer_size(const rdplib_endpoint_t *endpoint, uint32_t *bytes);
+
+RDPLIB_API int rdplib_endpoint_get_input_rate(const rdplib_endpoint_t *endpoint, rdplib_endpoint_input_rate_t *input_rate);
 
 // Wait for an arrival, then move everything currently ready to the application queues.
 RDPLIB_API int rdplib_endpoint_process(rdplib_endpoint_t *endpoint, int32_t timeout_ms);
@@ -129,6 +185,7 @@ RDPLIB_API int rdplib_connection_begin_close(rdplib_connection_t *connection, ui
 RDPLIB_API int rdplib_connection_set_data_rate(rdplib_connection_t *connection, uint32_t bytes_per_second);
 RDPLIB_API int rdplib_connection_set_send_buffer_size(rdplib_connection_t *connection, uint32_t bytes);
 RDPLIB_API int rdplib_connection_get_remote_ipv4(rdplib_connection_t *connection, uint8_t address[4], uint16_t *port);
+RDPLIB_API int rdplib_connection_get_counters(rdplib_connection_t *connection, rdplib_connection_counters_t *counters);
 RDPLIB_API int rdplib_connection_get_perf_stats(rdplib_connection_t *connection, rdplib_connection_perf_stats_t *statistics);
 RDPLIB_API int rdplib_connection_get_disconnect_info(rdplib_connection_t *connection, rdplib_disconnect_info_t *information);
 

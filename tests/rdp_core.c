@@ -14,6 +14,7 @@
 #include "eventq.h"
 #include "fast.h"
 #include "rdp.h"
+#include "rdplib_rdp.h"
 #include "rdpstat.h"
 #include "rx.h"
 #include "usend.h"
@@ -105,6 +106,7 @@ _Static_assert(_Generic(&rdp_connect, uint32_t (*)(rdp_t *, connection_t **, cha
 _Static_assert(_Generic(&rdp_connection_mark_for_delete, void (*)(rdp_t *, connection_t *): 1, default: 0), "rdp_connection_mark_for_delete signature");
 _Static_assert(_Generic(&connection_close_wait, uint32_t (*)(connection_t *, uint32_t, uint32_t *): 1, default: 0), "connection_close_wait signature");
 _Static_assert(_Generic(&rdp_receive, msg_arrival_t *(*)(rdp_t *, uint32_t): 1, default: 0), "rdp_receive signature");
+_Static_assert(_Generic(&rdplib_rdp_get_input_rate, void (*)(rdp_t *, rdplib_rdp_input_rate_t *): 1, default: 0), "rdplib_rdp_get_input_rate signature");
 _Static_assert(_Generic(&rdp_get_input_rate, uint32_t (*)(rdp_t *): 1, default: 0), "rdp_get_input_rate signature");
 _Static_assert(_Generic(&rdp_serial_tx_ready, uint32_t (*)(rdp_t *): 1, default: 0), "rdp_serial_tx_ready signature");
 _Static_assert(_Generic(&rdp_serial_get_time_empty, uint32_t (*)(rdp_t *): 1, default: 0), "rdp_serial_get_time_empty signature");
@@ -315,7 +317,11 @@ static void test_init_selectivity(void)
     assert(owner.message_rxq.list.head == NULL && owner.message_rxq.list.size == 0);
     assert(owner.external_rxq.list.head == NULL && owner.external_rxq.list.size == 0);
     assert(owner.bytes_recvd == 0 && owner.duplicate_bytes_recvd == 0);
+#ifdef RDPLIB_TEST_SOURCE_FAITHFUL
     assert(owner.bytes_per_second == UINT32_C(0xa5a5a5a5)); // The recovered duplicate assignment leaves this field untouched.
+#else
+    assert(owner.bytes_per_second == 0);
+#endif
     assert(owner.duplicate_bytes_per_second == 0);
     assert(owner.encrypt == UINT32_C(0xa5a5a5a5) && owner.crc == UINT32_C(0xa5a5a5a5));
     assert((int32_t)(owner.last_sample - before) >= 0 && (int32_t)(after - owner.last_sample) >= 0);
@@ -609,6 +615,7 @@ static void test_serial_drain_and_forwarders(void)
     uint32_t after;
     uint32_t scheduled;
     uint32_t empty_time;
+    rdplib_rdp_input_rate_t input_rate;
 
     owner_fixture_init(&fixture);
     assert(serial_create(&fixture.owner.serial, 4321) == 0);
@@ -620,9 +627,12 @@ static void test_serial_drain_and_forwarders(void)
     assert((int32_t)(scheduled - before) >= 100 && (int32_t)(scheduled - after) <= 100);
 
     fixture.owner.bytes_per_second = 34567;
+    fixture.owner.duplicate_bytes_per_second = 76543;
+    memset(&input_rate, 0, sizeof(input_rate));
+    rdplib_rdp_get_input_rate(&fixture.owner, &input_rate);
+    assert(input_rate.bytes_per_second == 34567 && input_rate.duplicate_bytes_per_second == 76543);
     assert(rdp_get_input_rate(&fixture.owner) == 34567);
 #ifdef RDP_DEAD_CODE
-    fixture.owner.duplicate_bytes_per_second = 76543;
     assert(rdp_get_duplicate_input_rate(&fixture.owner) == 76543);
 #endif
     assert(rdp_serial_tx_ready(&fixture.owner) == serial_tx_ready(&fixture.owner.serial));

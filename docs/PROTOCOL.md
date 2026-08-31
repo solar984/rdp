@@ -95,8 +95,8 @@ The fields occur in exactly this order:
 
 The fixed header is 4 bytes.  The ACK portion is 2 through 17 bytes.  A connected datagram carrying every optional field can have 31 bytes before its application payload and framing trailer.
 
-The I/O thread reads UDP into a fixed 536 byte buffer, so a maximum header and maximum payload do not always fit together.  For a 512 byte fragment carrying an ACK base, these are the largest masks that
-still fit:
+The source faithful I/O thread reads UDP into a fixed 536 byte buffer, so a maximum header and maximum payload do not always fit together.  For a 512 byte fragment carrying an ACK base, these are the
+largest masks that still fit:
 
 | Framing   | Fragment without stream fields | Fragment zero with both stream bytes |
 | --------- | -----------------------------: | -----------------------------------: |
@@ -106,7 +106,9 @@ still fit:
 
 The encrypted limits include CRC and the extra full padding block added to an already aligned packet.  ACK only packets and packets with smaller payloads can use the full 15 byte mask.
 
-The original sender does not shorten a fragment or ACK mask to fit the 536 byte receive buffer.  It can send a maximum fragment with a large piggybacked mask that another client cannot receive whole.  Do not use this combination.
+The original sender does not shorten a fragment or ACK mask to fit the 536 byte receive buffer.  It can send a maximum fragment with a large piggybacked mask that another client cannot receive whole.
+The maintained receiver accepts the maximum 552 byte connected datagram.  Its sender also keeps compatibility with original peers: when a piggybacked ACK would exceed 536 bytes after CRC and cipher
+framing, it sends the data without ACK fields and follows it with an ACK only packet.
 
 Every connected packet, including an ACK only packet, has a packet sequence.  A retransmission keeps its reliable message ID but gets the sender's current packet sequence.  The packet sequence only
 advances after a successful send.
@@ -944,6 +946,7 @@ abort do not publish another disconnect in the default build.
 The default build adds checks and state corrections around these boundaries without changing normal wire output:
 
 - UDP vector size and framing workspace;
+- maximum connected receive capacity and legacy-safe piggybacked ACK splitting;
 - selected field parser bounds, fragment count, and final fragment size;
 - application send stream, size, allocation, and projected history bounds;
 - ACK state after a retryable backend send and reliable history space for keepalive and FIN;
@@ -1031,7 +1034,7 @@ loss declaration.
 | Property                             |                                           Value |
 | ------------------------------------ | ----------------------------------------------: |
 | Connected base header                |                                         4 bytes |
-| Owner UDP receive workspace          |                                       536 bytes |
+| Owner UDP receive workspace          |              536 source faithful; 552 maintained |
 | ACK base                             |                                         2 bytes |
 | Maximum ACK mask                     |                             15 bytes / 120 bits |
 | Reliable message ID                  |                                         16 bits |

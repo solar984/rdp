@@ -67,10 +67,16 @@ static void verify_signatures(void)
     int32_t (*append_crc)(char *, int32_t) = rdp_append_crc;
     int32_t (*encode_data)(char *, int32_t) = rdp_encode_data;
     uint32_t (*send_vector)(intptr_t, iov_t *, uint32_t, struct sockaddr *, uint32_t, uint32_t) = usend;
+#ifndef RDPLIB_TEST_SOURCE_FAITHFUL
+    uint32_t (*framed_size)(uint32_t, uint32_t, uint32_t) = rdplib_usend_framed_size;
+#endif
 
     (void)append_crc;
     (void)encode_data;
     (void)send_vector;
+#ifndef RDPLIB_TEST_SOURCE_FAITHFUL
+    (void)framed_size;
+#endif
 }
 
 static void loopback_pair_create(loopback_pair_t *pair)
@@ -213,6 +219,16 @@ static void test_scatter_gather_wire(void)
 }
 
 #ifndef RDPLIB_TEST_SOURCE_FAITHFUL
+static void test_framed_sizes(void)
+{
+    assert(rdplib_usend_framed_size(543, 0, 0) == 543);
+    assert(rdplib_usend_framed_size(543, 0, 1) == 547);
+    assert(rdplib_usend_framed_size(543, 1, 0) == 552);
+    assert(rdplib_usend_framed_size(543, 1, 1) == 552);
+    assert(rdplib_usend_framed_size(532, 0, 1) == 536);
+    assert(rdplib_usend_framed_size(533, 0, 1) == 537);
+}
+
 typedef struct drop_capture_t
 {
     const uint8_t *expected;
@@ -393,6 +409,7 @@ int main(void)
     test_encode_padding_counts();
     test_scatter_gather_wire();
 #ifndef RDPLIB_TEST_SOURCE_FAITHFUL
+    test_framed_sizes();
     test_checked_drop_adapter_sees_joined_plaintext();
     test_checked_allow_adapter_sends_joined_snapshot();
     test_checked_arguments_and_capacity();

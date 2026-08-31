@@ -21,6 +21,7 @@ int32_t rdp_encode_data(char *buffer, int32_t buffer_size);
 uint32_t usend(intptr_t socket, iov_t *iov, uint32_t iov_len, struct sockaddr *remote_addr, uint32_t encrypt, uint32_t crc);
 
 #ifndef RDPLIB_SOURCE_FAITHFUL
+uint32_t rdplib_usend_framed_size(uint32_t plaintext_bytes, uint32_t encrypt, uint32_t crc);
 // Maintained connected send adapter. The callback sees the joined plaintext before CRC and encryption; when accepted, that same snapshot is framed and sent.
 uint32_t rdplib_usend(struct connection_t *connection, intptr_t socket, iov_t *iov, uint32_t iov_len, struct sockaddr *remote_addr, uint32_t encrypt, uint32_t crc);
 #endif

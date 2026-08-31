@@ -97,6 +97,21 @@ int32_t rdp_encode_data(char *buffer, int32_t buffer_size)
     return buffer_size;
 }
 
+#ifndef RDPLIB_SOURCE_FAITHFUL
+uint32_t rdplib_usend_framed_size(uint32_t plaintext_bytes, uint32_t encrypt, uint32_t crc)
+{
+    if (crc || encrypt)
+    {
+        plaintext_bytes += sizeof(uint32_t);
+    }
+    if (encrypt)
+    {
+        plaintext_bytes = (plaintext_bytes + BLOCKSIZE) & ~(uint32_t)(BLOCKSIZE - 1);
+    }
+    return plaintext_bytes;
+}
+#endif
+
 uint32_t usend(intptr_t socket, iov_t *iov, uint32_t iov_len, struct sockaddr *remote_addr, uint32_t encrypt, uint32_t crc)
 {
     int32_t buffer_size;
@@ -184,22 +199,10 @@ static uint32_t rdplib_usend_validate(iov_t *iov, uint32_t iov_len, struct socka
         *buffer_size += iov[i].size;
     }
 
-    framed_size = *buffer_size;
-    if (crc || encrypt)
+    framed_size = rdplib_usend_framed_size(*buffer_size, encrypt, crc);
+    if (framed_size > USEND_MAX_SIZE)
     {
-        if (framed_size > USEND_MAX_SIZE - sizeof(uint32_t))
-        {
-            return RDP_USEND_CAPACITY_EXCEEDED;
-        }
-        framed_size += sizeof(uint32_t);
-    }
-    if (encrypt)
-    {
-        framed_size = (framed_size + BLOCKSIZE) & ~(uint32_t)(BLOCKSIZE - 1);
-        if (framed_size > USEND_MAX_SIZE)
-        {
-            return RDP_USEND_CAPACITY_EXCEEDED;
-        }
+        return RDP_USEND_CAPACITY_EXCEEDED;
     }
     return 0;
 }

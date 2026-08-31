@@ -15,6 +15,7 @@
 
 #include "connhash.h"
 #include "fast.h"
+#include "protocol_limits.h"
 #include "rdp.h"
 #include "rdplib_platform.h"
 #include "rdpstat.h"
@@ -79,6 +80,7 @@ enum
     TEST_BACKEND_USEND,
     TEST_BACKEND_RDPLIB_USEND,
     TEST_BACKEND_SERIAL,
+    TEST_BACKEND_CALL_CAPACITY = 4,
     TEST_PACKET_CAPACITY = 2048
 };
 
@@ -114,8 +116,13 @@ static uint32_t test_backend_calls;
 static uint32_t test_backend_iov_len;
 static uint8_t test_backend_packet[TEST_PACKET_CAPACITY];
 static uint32_t test_backend_packet_size;
+static uint32_t test_backend_result_count;
+static uint32_t test_backend_results[TEST_BACKEND_CALL_CAPACITY];
+static uint8_t test_backend_packets[TEST_BACKEND_CALL_CAPACITY][TEST_PACKET_CAPACITY];
+static uint32_t test_backend_packet_sizes[TEST_BACKEND_CALL_CAPACITY];
 static uint32_t test_ack_enabled;
 static uint16_t test_ack_msgid;
+static uint32_t test_ack_mask_bytes;
 static int test_socket_results[4];
 static uint32_t test_socket_result_count;
 static uint32_t test_socket_calls;
@@ -161,8 +168,13 @@ static void reset_harness(void)
     test_backend_iov_len = 0;
     test_backend_packet_size = 0;
     memset(test_backend_packet, 0, sizeof(test_backend_packet));
+    test_backend_result_count = 0;
+    memset(test_backend_results, 0, sizeof(test_backend_results));
+    memset(test_backend_packets, 0, sizeof(test_backend_packets));
+    memset(test_backend_packet_sizes, 0, sizeof(test_backend_packet_sizes));
     test_ack_enabled = 0;
     test_ack_msgid = 0;
+    test_ack_mask_bytes = 0;
     memset(test_socket_results, 0, sizeof(test_socket_results));
     test_socket_result_count = 0;
     test_socket_calls = 0;
@@ -326,16 +338,21 @@ void rx_flush_input_buffers(connection_t *c)
 
 uint32_t rx_append_ack(connection_t *c, uint16_t *dst, uint16_t *options)
 {
+    uint8_t *mask;
+
     if (!test_ack_enabled)
     {
         return 0;
     }
-    *options |= RDP_FLAG_ACKTHRU;
+    assert(test_ack_mask_bytes <= 15u);
+    *options |= (uint16_t)(RDP_FLAG_ACKTHRU | (test_ack_mask_bytes << 4));
     *dst = htons(test_ack_msgid);
+    mask = (uint8_t *)(dst + 1);
+    memset(mask, 0x80, test_ack_mask_bytes);
     c->rx_msgid_count = 0;
     c->rx_msgid_lo = test_ack_msgid;
     c->rx_msgid_hi = test_ack_msgid;
-    return 2;
+    return 2u + test_ack_mask_bytes;
 }
 
 uint32_t rdp_serial_tx_ready(rdp_t *rdp)
@@ -352,10 +369,13 @@ uint32_t rdp_serial_get_time_empty(rdp_t *rdp)
 
 static uint32_t capture_backend(uint32_t kind, iov_t *iov, uint32_t iov_len)
 {
+    uint32_t call_index;
     uint32_t index;
+    uint32_t result;
 
+    call_index = test_backend_calls;
+    assert(call_index < TEST_BACKEND_CALL_CAPACITY);
     test_backend_kind = kind;
-    ++test_backend_calls;
     test_backend_iov_len = iov_len;
     test_backend_packet_size = 0;
     for (index = 0; index < iov_len; ++index)
@@ -368,7 +388,11 @@ static uint32_t capture_backend(uint32_t kind, iov_t *iov, uint32_t iov_len)
         }
         test_backend_packet_size += iov[index].size;
     }
-    return test_backend_result;
+    memcpy(test_backend_packets[call_index], test_backend_packet, test_backend_packet_size);
+    test_backend_packet_sizes[call_index] = test_backend_packet_size;
+    result = call_index < test_backend_result_count ? test_backend_results[call_index] : test_backend_result;
+    ++test_backend_calls;
+    return result;
 }
 
 uint32_t usend(intptr_t socket, iov_t *iov, uint32_t iov_len, struct sockaddr *remote_addr, uint32_t encrypt, uint32_t crc)
@@ -378,6 +402,19 @@ uint32_t usend(intptr_t socket, iov_t *iov, uint32_t iov_len, struct sockaddr *r
     (void)encrypt;
     (void)crc;
     return capture_backend(TEST_BACKEND_USEND, iov, iov_len);
+}
+
+uint32_t rdplib_usend_framed_size(uint32_t plaintext_bytes, uint32_t encrypt, uint32_t crc)
+{
+    if (crc || encrypt)
+    {
+        plaintext_bytes += sizeof(uint32_t);
+    }
+    if (encrypt)
+    {
+        plaintext_bytes = (plaintext_bytes + 8u) & ~UINT32_C(7);
+    }
+    return plaintext_bytes;
 }
 
 uint32_t rdplib_usend(connection_t *c, intptr_t socket, iov_t *iov, uint32_t iov_len, struct sockaddr *remote_addr, uint32_t encrypt, uint32_t crc)
@@ -949,6 +986,107 @@ static void test_send_packet_results(void)
 #endif
 }
 
+#ifndef RDPLIB_TEST_SOURCE_FAITHFUL
+static void prepare_pending_ack(connection_t *c, uint32_t mask_bytes)
+{
+    test_ack_enabled = 1;
+    test_ack_msgid = UINT16_C(0x2345);
+    test_ack_mask_bytes = mask_bytes;
+    c->rx_msgid_count = 1;
+    c->rx_msgid_lo = test_ack_msgid;
+    c->rx_msgid_hi = (uint16_t)(test_ack_msgid + mask_bytes * 8u);
+    c->tx_delayed_ack = 1;
+    c->tx_ack_time = test_now + 50u;
+}
+
+static void test_piggyback_ack_datagram_limit(void)
+{
+    static char fragment_zero[522];
+    const uint16_t data_flags = RDP_FLAG_MSGID | RDP_FLAG_FRAGMENT | RDP_FLAG_SEQUENCED;
+    connection_t c;
+    rdp_t rdp;
+    uint16_t flags;
+
+    // A four-byte mask produces exactly 536 CRC-framed bytes and remains
+    // piggybacked on fragment zero.
+    reset_harness();
+    initialize_connection(&c, &rdp, RDP_TRANSMIT_ADDRESS_IPV4);
+    rdp.crc = 1;
+    c.tx_next_seqnum = 77;
+    prepare_pending_ack(&c, 4);
+    assert(tx_send_packet(&c, fragment_zero, sizeof(fragment_zero), data_flags) == 0);
+    assert(test_backend_calls == 1);
+    assert(rdplib_usend_framed_size(test_backend_packet_sizes[0], 0, 1) == RDP_LEGACY_DATAGRAM_BYTES);
+    flags = load_network_u16(test_backend_packets[0]);
+    assert((flags & data_flags) == data_flags);
+    assert((flags & RDP_FLAG_ACKTHRU) != 0);
+    assert((flags & RDP_FLAG_ACK_MASK_LENGTH) == 4u << 4);
+    assert(load_network_u16(test_backend_packets[0] + 2) == 77);
+    assert(c.tx_next_seqnum == 78);
+    assert(test_statistics.ack_and_data_packets_tx == 1);
+    assert(test_statistics.ack_only_packets_tx == 0);
+    destroy_connection(&c);
+
+    // Adding the fifth mask byte would produce 537 bytes. The data is sent
+    // without ACK fields, followed by a header-only ACK datagram.
+    reset_harness();
+    initialize_connection(&c, &rdp, RDP_TRANSMIT_ADDRESS_IPV4);
+    rdp.crc = 1;
+    c.tx_next_seqnum = 77;
+    prepare_pending_ack(&c, 5);
+    assert(tx_send_packet(&c, fragment_zero, sizeof(fragment_zero), data_flags) == 0);
+    assert(test_backend_calls == 2);
+    assert(test_backend_packet_sizes[0] == RDP_WIRE_HEADER_BASE_BYTES + sizeof(fragment_zero));
+    assert(test_backend_packet_sizes[1] == RDP_WIRE_HEADER_BASE_BYTES + 2u + 5u);
+    assert(rdplib_usend_framed_size(test_backend_packet_sizes[0], 0, 1) <= RDP_LEGACY_DATAGRAM_BYTES);
+    assert(rdplib_usend_framed_size(test_backend_packet_sizes[1], 0, 1) <= RDP_LEGACY_DATAGRAM_BYTES);
+
+    flags = load_network_u16(test_backend_packets[0]);
+    assert((flags & data_flags) == data_flags);
+    assert((flags & (RDP_FLAG_ACKTHRU | RDP_FLAG_MASKOFFSET | RDP_FLAG_ACK_MASK_LENGTH)) == 0);
+    assert(load_network_u16(test_backend_packets[0] + 2) == 77);
+
+    flags = load_network_u16(test_backend_packets[1]);
+    assert((flags & (RDP_FLAG_MSGID | RDP_FLAG_FRAGMENT | RDP_FLAG_SEQUENCED)) == 0);
+    assert((flags & RDP_FLAG_ACKTHRU) != 0);
+    assert((flags & RDP_FLAG_ACK_MASK_LENGTH) == 5u << 4);
+    assert(load_network_u16(test_backend_packets[1] + 2) == 78);
+    assert(c.tx_next_seqnum == 79);
+    assert(c.rx_msgid_count == 0 && c.tx_delayed_ack == 0);
+    assert(test_statistics.ack_and_data_packets_tx == 0);
+    assert(test_statistics.ack_only_packets_tx == 1);
+    assert(test_statistics.sendto_calls == 2);
+    assert(c.tx_bandwidth.queue_size ==
+           RDP_WIRE_HEADER_BASE_BYTES + sizeof(fragment_zero) + 28u +
+           RDP_WIRE_HEADER_BASE_BYTES + 2u + 5u + 28u);
+    destroy_connection(&c);
+
+    // If only the follow-up ACK meets backpressure, the data sequence remains
+    // committed and the complete ACK report remains pending for retry.
+    reset_harness();
+    initialize_connection(&c, &rdp, RDP_TRANSMIT_ADDRESS_IPV4);
+    rdp.crc = 1;
+    c.tx_next_seqnum = 77;
+    prepare_pending_ack(&c, 5);
+    test_backend_result_count = 2;
+    test_backend_results[0] = 0;
+    test_backend_results[1] = 5;
+    assert(tx_send_packet(&c, fragment_zero, sizeof(fragment_zero), data_flags) == 0);
+    assert(test_backend_calls == 2);
+    assert(c.tx_next_seqnum == 78);
+    assert(c.rx_msgid_count == 1 && c.tx_delayed_ack == 1);
+    assert(load_network_u16(test_backend_packets[1] + 2) == 78);
+
+    test_backend_result_count = 0;
+    assert(tx_send_packet(&c, NULL, 0, 0) == 0);
+    assert(test_backend_calls == 3);
+    assert(load_network_u16(test_backend_packets[2] + 2) == 78);
+    assert(c.tx_next_seqnum == 79);
+    assert(c.rx_msgid_count == 0 && c.tx_delayed_ack == 0);
+    destroy_connection(&c);
+}
+#endif
+
 #ifdef RDPLIB_DEBUG
 static void test_queue_delay_statistics(void)
 {
@@ -1216,6 +1354,9 @@ int main(void)
     test_checked_and_faithful_edges();
     test_send_boundaries();
     test_send_packet_results();
+#ifndef RDPLIB_TEST_SOURCE_FAITHFUL
+    test_piggyback_ack_datagram_limit();
+#endif
 #ifdef RDPLIB_DEBUG
     test_queue_delay_statistics();
 #endif

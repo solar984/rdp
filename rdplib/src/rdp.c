@@ -23,7 +23,7 @@
 #ifdef RDPLIB_SOURCE_FAITHFUL
 #include "log.h"
 #endif
-#ifdef RDPLIB_DEBUG
+#if defined(RDPLIB_DEBUG) || !defined(RDPLIB_SOURCE_FAITHFUL)
 #include "protocol_limits.h"
 #endif
 #ifndef RDPLIB_SOURCE_FAITHFUL
@@ -856,7 +856,11 @@ void rdp_io_thread(void *data)
     uint32_t event_processing_time;
     int32_t char_recv;
     struct sockaddr remote_addr;
+#ifdef RDPLIB_SOURCE_FAITHFUL
     char scratch[536];
+#else
+    char scratch[RDP_MAX_CONNECTED_DATAGRAM_BYTES];
+#endif
     uint32_t enabled_sources;
     uint32_t ready_sources;
     struct _timeout_data next_event;

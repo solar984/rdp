@@ -9,7 +9,8 @@ This document lists the important cases a raw API caller takes responsibility fo
 ## Datagram and parser constraints
 
 - `usend` joins scatter/gather buffers in a fixed 32,768 byte local workspace.  The recovered function does not reserve space for CRC or encryption padding and does not validate the combined vector size.
-- The endpoint receives UDP into 536 bytes.  A 512 byte fragment with every optional header field, a full ACK mask, CRC, and cipher padding can exceed that buffer.  The sender does not automatically reduce the fragment or ACK mask to fit it.
+- Source faithful endpoints receive UDP into 536 bytes. A 512 byte fragment plus all possible optional header, ACK mask, CRC, and cipher bytes can exceed that workspace. The maintained build receives
+  the maximum 552 byte connected datagram and sends an ACK separately when piggybacking it would exceed an original peer's 536 byte receive capacity.
 - The recovered connected parser reads the flag selected ACK, message, fragment, and stream fields before checking the claimed length.  A physically short datagram can therefore be read beyond its supplied length.
 - Every nonfinal fragment must contain 512 bytes.  The recovered final fragment check does not enforce the sender's 1..512 byte rule.
 - A 0 byte final fragment can enter reliable receive bookkeeping, but normal input handling does not assemble it because it has neither payload nor FIN.  Its reliable ID may be acknowledged while the group remains incomplete.

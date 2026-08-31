@@ -1601,6 +1601,8 @@ uint32_t tx_send_packet(connection_t *c, char *data, uint32_t size, uint16_t opt
     uint32_t result;
     uint16_t *options;
 #ifndef RDPLIB_SOURCE_FAITHFUL
+    uint32_t send_ack_separately = 0;
+    uint16_t options_without_ack;
     uint16_t saved_unreported_message_count = c->rx_msgid_count;
     uint16_t saved_unreported_min_message_id = c->rx_msgid_lo;
     uint16_t saved_unreported_max_message_id = c->rx_msgid_hi;
@@ -1632,6 +1634,9 @@ uint32_t tx_send_packet(connection_t *c, char *data, uint32_t size, uint16_t opt
         *options |= RDP_FLAG_RESET;
     }
 
+#ifndef RDPLIB_SOURCE_FAITHFUL
+    options_without_ack = *options;
+#endif
     header[header_size / 2u] = htons(c->tx_next_seqnum);
     header_size += 2;
     ack_size = rx_append_ack(c, &header[header_size / 2u], options);
@@ -1640,6 +1645,35 @@ uint32_t tx_send_packet(connection_t *c, char *data, uint32_t size, uint16_t opt
     assert(ack_size || !c->tx_delayed_ack);
 #endif
     c->tx_delayed_ack = 0;
+
+#ifndef RDPLIB_SOURCE_FAITHFUL
+    if (data && ack_size)
+    {
+        uint32_t framed_size = header_size + size;
+
+        if (c->tx_remote_addr.sa_family != RDP_TRANSMIT_ADDRESS_SERIAL)
+        {
+            framed_size = rdplib_usend_framed_size(framed_size, c->cn_rdp->encrypt, c->cn_rdp->crc);
+        }
+
+        if (framed_size > RDP_LEGACY_DATAGRAM_BYTES)
+        {
+            // Keep each wire datagram within an original peer's receive
+            // capacity. The successful data send is followed by an ACK-only
+            // packet carrying the complete acknowledgement report.
+            c->rx_msgid_count = saved_unreported_message_count;
+            c->rx_msgid_lo = saved_unreported_min_message_id;
+            c->rx_msgid_hi = saved_unreported_max_message_id;
+            c->tx_delayed_ack = saved_delayed_ack_pending;
+            c->tx_ack_time = saved_delayed_ack_deadline_ms;
+
+            *options = options_without_ack;
+            header_size = RDP_WIRE_HEADER_BASE_BYTES;
+            ack_size = 0;
+            send_ack_separately = 1;
+        }
+    }
+#endif
 
     if (ack_size)
     {
@@ -1727,6 +1761,14 @@ uint32_t tx_send_packet(connection_t *c, char *data, uint32_t size, uint16_t opt
     {
         bandwidth_enqueue_bytes(&c->tx_bandwidth, header_size + size + 28u);
         ++c->tx_next_seqnum;
+#ifndef RDPLIB_SOURCE_FAITHFUL
+        if (send_ack_separately)
+        {
+            // The data has already been submitted. A retryable ACK send
+            // restores the pending report through the normal maintained path.
+            (void)tx_send_packet(c, NULL, 0, 0);
+        }
+#endif
     }
 
     return result;

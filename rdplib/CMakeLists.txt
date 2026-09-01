@@ -29,6 +29,7 @@ set(RDPLIB_SOURCES
     src/msg_arrival.c
     src/msg_outgoing.c
     src/rdplib.c
+    src/rdplib_rdpstat.c
     src/pqueue.c
     src/txq.c
     src/rdp.c
@@ -71,6 +72,14 @@ endif()
 if(NOT RDPLIB_SOURCE_FAITHFUL)
     list(APPEND RDPLIB_SOURCES src/rdplib_random.c)
 endif()
+
+set_source_files_properties(
+    src/connection.c
+    src/rdp.c
+    src/rx.c
+    src/tx.c
+    PROPERTIES COMPILE_DEFINITIONS RDPLIB_DISCARD_GLOBAL_STATISTICS
+)
 
 function(rdplib_configure_library target_name)
     target_include_directories(${target_name}

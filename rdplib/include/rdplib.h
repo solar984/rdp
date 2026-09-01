@@ -131,7 +131,8 @@ RDPLIB_API int rdplib_endpoint_create(rdplib_runtime_t *runtime, rdplib_endpoint
 RDPLIB_API int rdplib_endpoint_create_ex(rdplib_runtime_t *runtime, rdplib_endpoint_t **output, uint16_t local_port, uint32_t expected_connections, uint32_t flags,
                                          const rdplib_endpoint_options_t *options);
 
-// Use an endpoint and all of its connections from a single application thread.  Destroy returns busy until every application connection handle has been released.
+// One serialized application context owns an endpoint and every handle obtained from it.  Connection sends are the only concurrent application operation.
+// Destroy returns busy until every application connection handle has been released.
 RDPLIB_API int rdplib_endpoint_destroy(rdplib_endpoint_t *endpoint);
 RDPLIB_API uint16_t rdplib_endpoint_local_port(const rdplib_endpoint_t *endpoint);
 RDPLIB_API int rdplib_endpoint_set_socket_receive_buffer_size(rdplib_endpoint_t *endpoint, uint32_t bytes);
@@ -155,7 +156,8 @@ RDPLIB_API int rdplib_connect(rdplib_endpoint_t *endpoint, rdplib_connection_t *
 
 // Drain messages before releasing a connection.  Start close first when the
 // peer should receive FIN.  Releasing an already dead connection cleans it up
-// immediately.
+// immediately.  Prevent new calls and wait for every active send to return
+// before release.  Release does not synchronize the lifetime of stale handles.
 RDPLIB_API void rdplib_connection_release(rdplib_connection_t *connection);
 RDPLIB_API int rdplib_connection_is_usable(rdplib_connection_t *connection);
 
@@ -168,7 +170,7 @@ RDPLIB_API int rdplib_connection_enable_keepalive_with_interval(rdplib_connectio
 // Install or replace the normal build's packet drop callback.  A null
 // callback removes it and waits for an already running callback to finish.  The
 // callback runs under the connection lock, either during an application send
-// or on the I/O thread, and must not reenter this connection.
+// or on the I/O thread, and must not reenter rdplib.
 // The source faithful build returns RDPLIB_ERROR_NOT_SUPPORTED.
 RDPLIB_API int rdplib_connection_set_packet_drop_callback(rdplib_connection_t *connection, rdplib_packet_drop_callback_t callback, void *context);
 
@@ -176,9 +178,13 @@ RDPLIB_API int rdplib_connection_set_packet_drop_callback(rdplib_connection_t *c
 RDPLIB_API rdplib_message_t *rdplib_connection_pop_message(rdplib_connection_t *connection);
 
 // Each transmit direction is established by its first reliable message.  The default build holds an earlier unreliable message until that reliable message is acknowledged.
+// Sends may execute concurrently on the same or different connection handles and may overlap endpoint processing or begin close.  Concurrent sends on one connection
+// are serialized in an unspecified order.
 RDPLIB_API int rdplib_connection_send(rdplib_connection_t *connection, const void *data, uint32_t bytes, uint32_t stream, uint32_t flags);
 
-// Drain queued messages first.  Starts close and returns immediately.  Calls may be repeated.
+// Drain queued messages first.  Starts close and returns immediately.  Calls may be repeated.  A successful close transition is serialized with concurrent sends,
+// but release still requires every sender to be quiescent.  Returning busy leaves the connection open.
+// Stop admitting new sends first when shutdown requires bounded progress.
 RDPLIB_API int rdplib_connection_begin_close(rdplib_connection_t *connection, uint32_t linger_timeout_ms);
 
 // The data rate must be greater than 0.

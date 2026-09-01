@@ -75,7 +75,17 @@ Send result 14 means the configured byte buffer is full.  Result 15 means there 
 
 ## Ownership and threading
 
-One application thread owns an endpoint and every handle obtained from it.  Different endpoints may be used by different application threads.
+One serialized application context owns an endpoint and every handle obtained from it.  The owning context calls every endpoint and connection operation except `rdplib_connection_send`.  Different endpoints may have different owning contexts.
+
+`rdplib_connection_send` is the only concurrent application operation.  Multiple application threads may call it concurrently, including multiple calls for the same connection, and those calls may overlap the owning context while the handle remains application owned.  This does not transfer or share ownership of the connection handle.
+
+Concurrent sends on one connection are serialized internally.  The order between overlapping calls is unspecified.  Applications which require ordering between producers must establish that ordering before calling rdplib.
+
+`rdplib_connection_begin_close` is linearized with concurrent sends.  A successful send ordered before a successful close transition is completed before close starts.  Once close starts, later sends return `RDPLIB_ERROR_NOT_USABLE` without consuming the message.  A close attempt which returns `RDPLIB_ERROR_BUSY` does not start that transition.
+
+Stop admitting new sends before beginning a shutdown which needs bounded progress.  Existing sends may safely finish concurrently with the close attempt, but mutex scheduling does not guarantee that close wins against an unlimited stream of new send calls.
+
+Release remains an exclusive lifetime operation.  Before calling `rdplib_connection_release`, the application must prevent new calls and wait for every active send to return.  No thread may use the handle after release begins.
 
 The I/O thread is private to the endpoint.  The application does not join or manipulate it.  Endpoint destruction stops and joins it internally.
 
@@ -115,9 +125,11 @@ Use the rdplib examples in [`examples/c/rdplib_server.c`](../examples/c/rdplib_s
 int rdplib_runtime_create(rdplib_runtime_t **output, uint32_t fast_allocator_bytes);
 ```
 
-Creates the process runtime and initializes the shared allocator and statistics.  `fast_allocator_bytes` is the allocator's initial byte budget and must be greater than 0.  The allocator grows when its pools are exhausted.
+Creates the process runtime and initializes the shared allocator.  `fast_allocator_bytes` is the allocator's initial byte budget and must be greater than 0.  The allocator grows when its pools are exhausted.
 
-Only one runtime may be active in a process.  The recovered transport stores its allocator and statistics globally.
+The recovered process global counters are not safe for concurrent connection activity.  The facade runtime redirects those writes to thread local discard storage in both behavior profiles.  Per connection counters and performance snapshots remain available through their connection APIs.  Direct raw API use outside the facade retains the recovered global counter behavior.
+
+Only one runtime may be active in a process because the recovered transport stores its allocator globally.
 
 Returns `RDPLIB_OK`, `RDPLIB_ERROR_INVALID_ARGUMENT`, or `RDPLIB_ERROR_OUT_OF_MEMORY`.
 
@@ -322,6 +334,8 @@ Passing null does nothing.  Debug builds assert if messages remain or if a live 
 
 This function has no return value.  A non null handle is freed and must not be used again.
 
+Release is not a sender lifetime barrier.  Before calling it, prevent new send calls and wait for every active send to return.  A mutex inside rdplib cannot protect a thread which retains a stale handle and enters after the handle has been freed.
+
 ### `rdplib_connection_is_usable`
 
 ```c
@@ -383,7 +397,7 @@ Outbound data is inspected after the send vector is joined and before CRC, encry
 
 Retransmissions, ACK packets, keepalives, and fragments are separate callback calls.  The callback cannot assume it has a complete application message.
 
-The callback runs under the connection lock.  Immediate output can call it from `rdplib_connection_send`.  Scheduled output and input call it from the I/O thread.  It must return quickly, must not retain or change the packet, and must not reenter rdplib for the same connection.
+The callback runs under the connection lock.  Immediate output can call it from `rdplib_connection_send`.  Scheduled output and input call it from the I/O thread.  It must return quickly, must not retain or change the packet, and must not reenter rdplib.  Reentry through a different connection can deadlock against another callback which acquires the same connections in the opposite order.
 
 Pass null as the callback to unregister it.  This waits for a callback which is already running.  Unregister it before the application can lose ownership of `context`.
 
@@ -430,6 +444,10 @@ Returns `RDPLIB_CONNECTION_SEND_OK`, a negative `RDPLIB_ERROR_*`, or a positive 
 
 rdplib copies the payload before returning.  The application keeps ownership of `data` and may reuse or release it after the call.
 
+This function may be called concurrently on the same or different connection handles.  Calls on one connection are serialized internally, but their order is unspecified when they overlap.  Sends on different connections do not share a facade lock.  Each call still returns its ordinary send result and can fail validation or encounter transport backpressure.
+
+The call may overlap endpoint processing and `rdplib_connection_begin_close`.  A send racing with peer FIN, disconnect, or local close either submits before that terminal transition or returns the applicable terminal result.
+
 ### `rdplib_connection_begin_close`
 
 ```c
@@ -439,6 +457,10 @@ int rdplib_connection_begin_close(
 ```
 
 Starts close and returns immediately.  Drain and release every queued message first.  Debug builds assert if messages remain; other builds return `RDPLIB_ERROR_BUSY`.
+
+This function is linearized with concurrent sends.  Once it successfully begins the close transition, later sends return `RDPLIB_ERROR_NOT_USABLE`.  Returning `RDPLIB_ERROR_BUSY` leaves the connection open.  This does not make release safe to race with senders.  The application must still prevent new calls and wait for every active send before releasing the handle.
+
+For bounded shutdown progress, stop admitting new sends before calling this function.  The close operation is safe to race with already active sends, but it is not given priority over an unlimited stream of new callers.
 
 After this call begins close, the handle can no longer send or inspect the underlying connection.  The I/O thread handles FIN, STOP, retransmission, and linger.
 

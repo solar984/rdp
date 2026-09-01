@@ -98,7 +98,14 @@ typedef struct rdp_stat
 } rdp_stat;
 
 // The linked TAKP clients publish application owned storage through this process global pointer. Counter updates are not synchronized between connections.
+void rdplib_discard_global_statistics(int discard);
+rdp_stat *rdplib_discarded_statistics(void);
+
+#ifdef RDPLIB_DISCARD_GLOBAL_STATISTICS
+#define g_rdp_stat (rdplib_discarded_statistics())
+#else
 extern rdp_stat *g_rdp_stat;
+#endif
 
 #ifdef RDP_DEAD_CODE
 // unused, retained for historical interest

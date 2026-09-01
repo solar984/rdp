@@ -56,11 +56,21 @@ add_executable(rdplib_api api.c)
 target_link_libraries(rdplib_api PRIVATE rdplib Threads::Threads)
 add_test(NAME rdplib_api COMMAND rdplib_api)
 
+add_executable(rdplib_multi_sender_api multi_sender_api.c)
+target_link_libraries(rdplib_multi_sender_api PRIVATE rdplib Threads::Threads)
+add_test(NAME rdplib_multi_sender_api COMMAND rdplib_multi_sender_api)
+set_tests_properties(rdplib_multi_sender_api PROPERTIES TIMEOUT 30)
+
 if(RDPLIB_BUILD_SHARED)
     add_executable(rdplib_shared_api api.c)
     target_link_libraries(rdplib_shared_api PRIVATE rdplib_shared Threads::Threads)
     add_test(NAME rdplib_shared_api COMMAND rdplib_shared_api)
     set_tests_properties(rdplib_shared_api PROPERTIES WORKING_DIRECTORY "$<TARGET_FILE_DIR:rdplib_shared>")
+
+    add_executable(rdplib_shared_multi_sender_api multi_sender_api.c)
+    target_link_libraries(rdplib_shared_multi_sender_api PRIVATE rdplib_shared Threads::Threads)
+    add_test(NAME rdplib_shared_multi_sender_api COMMAND rdplib_shared_multi_sender_api)
+    set_tests_properties(rdplib_shared_multi_sender_api PROPERTIES TIMEOUT 30 WORKING_DIRECTORY "$<TARGET_FILE_DIR:rdplib_shared>")
 endif()
 
 add_executable(rdplib_tx_ack tx_ack.c)

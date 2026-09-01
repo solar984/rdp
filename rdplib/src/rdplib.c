@@ -37,6 +37,7 @@ struct rdplib_connection_t
     struct rdplib_connection_t *accept_next;
     rdplib_endpoint_t *endpoint;
     connection_t *raw;
+    rdplib_platform_mutex_t send_lock;
     rdplib_message_t *message_head;
     rdplib_message_t *message_tail;
     uint8_t remote_address[16];
@@ -81,6 +82,7 @@ static void rdplib_connection_destroy_handle(rdplib_connection_t *connection)
     assert(connection->message_head == NULL);
     assert(connection->endpoint == NULL);
     assert(!connection->application_owned);
+    rdplib_platform_mutex_destroy(&connection->send_lock);
     rdplib_platform_free(connection);
 }
 
@@ -127,12 +129,13 @@ void rdplib_connection_release(rdplib_connection_t *connection)
     }
 
     assert(connection->application_owned);
-    assert(!connection->raw || connection->close_started || connection->peer_fin || connection->disconnected);
     assert(connection->message_head == NULL);
     endpoint = connection->endpoint;
     assert(endpoint != NULL);
     assert(endpoint->application_connection_count != 0);
 
+    rdplib_platform_mutex_lock(&connection->send_lock);
+    assert(!connection->raw || connection->close_started || connection->peer_fin || connection->disconnected);
     raw = connection->raw;
     if (raw)
     {
@@ -143,6 +146,7 @@ void rdplib_connection_release(rdplib_connection_t *connection)
         (void)connection_close(raw, 0, NULL, NULL);
         connection->raw = NULL;
     }
+    rdplib_platform_mutex_unlock(&connection->send_lock);
 
     rdplib_endpoint_remove_connection(endpoint, connection);
     --endpoint->application_connection_count;
@@ -181,6 +185,8 @@ static rdplib_connection_t *rdplib_create_connection_handle(rdplib_endpoint_t *e
     }
 
     memset(connection, 0, sizeof(*connection));
+    rdplib_platform_mutex_prepare(&connection->send_lock);
+    rdplib_platform_mutex_init(&connection->send_lock);
     connection->endpoint = endpoint;
     connection->raw = borrowed;
     connection->application_owned = (uint8_t)(accept_pending == 0);
@@ -237,6 +243,11 @@ static rdplib_message_t *rdplib_wrap_message(rdplib_endpoint_t *endpoint, msg_ar
 
 static void rdplib_queue_connection_message(rdplib_connection_t *connection, rdplib_message_t *message)
 {
+    int has_fin;
+    int is_disconnect;
+
+    has_fin = rdplib_message_has_fin(message);
+    is_disconnect = rdplib_message_is_disconnect(message);
     if (connection->message_tail)
     {
         connection->message_tail->next = message;
@@ -246,13 +257,19 @@ static void rdplib_queue_connection_message(rdplib_connection_t *connection, rdp
         connection->message_head = message;
     }
     connection->message_tail = message;
-    if (rdplib_message_has_fin(message))
+
+    if (has_fin || is_disconnect)
     {
-        connection->peer_fin = 1;
-    }
-    if (rdplib_message_is_disconnect(message))
-    {
-        connection->disconnected = 1;
+        rdplib_platform_mutex_lock(&connection->send_lock);
+        if (has_fin)
+        {
+            connection->peer_fin = 1;
+        }
+        if (is_disconnect)
+        {
+            connection->disconnected = 1;
+        }
+        rdplib_platform_mutex_unlock(&connection->send_lock);
     }
 }
 
@@ -329,6 +346,7 @@ int rdplib_runtime_create(rdplib_runtime_t **output, uint32_t fast_allocator_byt
     rdplib_platform_mutex_init(&runtime->lock);
     fast_malloc_init(fast_allocator_bytes);
     g_rdp_stat = &runtime->statistics;
+    rdplib_discard_global_statistics(1);
     rdplib_active_runtime = runtime;
     *output = runtime;
     return RDPLIB_OK;
@@ -355,6 +373,7 @@ int rdplib_runtime_destroy(rdplib_runtime_t *runtime)
     }
 
     rdplib_active_runtime = NULL;
+    rdplib_discard_global_statistics(0);
 #ifdef RDP_DEAD_CODE
     g_rdp_stat = &rdp_stat_struct;
 #else
@@ -791,11 +810,17 @@ int rdplib_connection_send(rdplib_connection_t *connection, const void *data, ui
     {
         return RDPLIB_ERROR_INVALID_ARGUMENT;
     }
+
+    rdplib_platform_mutex_lock(&connection->send_lock);
     if (!connection->raw || connection->close_started || connection->peer_fin || connection->disconnected)
     {
-        return RDPLIB_ERROR_NOT_USABLE;
+        result = RDPLIB_ERROR_NOT_USABLE;
     }
-    result = connection_send(connection->raw, data, bytes, stream, flags);
+    else
+    {
+        result = connection_send(connection->raw, data, bytes, stream, flags);
+    }
+    rdplib_platform_mutex_unlock(&connection->send_lock);
     return result;
 }
 
@@ -808,24 +833,33 @@ int rdplib_connection_begin_close(rdplib_connection_t *connection, uint32_t ling
     {
         return RDPLIB_ERROR_INVALID_ARGUMENT;
     }
+
+    rdplib_platform_mutex_lock(&connection->send_lock);
     if (connection->close_started)
     {
-        return RDPLIB_OK;
+        result = RDPLIB_OK;
     }
-    if (!connection->raw)
+    else if (!connection->raw)
     {
-        return RDPLIB_ERROR_NOT_USABLE;
+        result = RDPLIB_ERROR_NOT_USABLE;
     }
-    assert(connection->message_head == NULL);
-    if (connection->message_head)
+    else
     {
-        return RDPLIB_ERROR_BUSY;
+        assert(connection->message_head == NULL);
+        if (connection->message_head)
+        {
+            result = RDPLIB_ERROR_BUSY;
+        }
+        else
+        {
+            raw = connection->raw;
+            connection->close_started = 1;
+            rdplib_connection_clear_packet_drop_callback(raw);
+            result = connection_close(raw, linger_timeout_ms, NULL, NULL);
+            connection->raw = NULL;
+        }
     }
-    raw = connection->raw;
-    connection->close_started = 1;
-    rdplib_connection_clear_packet_drop_callback(raw);
-    result = connection_close(raw, linger_timeout_ms, NULL, NULL);
-    connection->raw = NULL;
+    rdplib_platform_mutex_unlock(&connection->send_lock);
     return result;
 }
 

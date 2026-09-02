@@ -33,9 +33,8 @@ static int ascending_timeout_data_cmp(const void *t1, const void *t2)
 }
 uint32_t eventq_create(eventq_t *eq, uint32_t grow_size)
 {
-    (void)grow_size;
     umutex_create(&eq->lock);
-    return pqueue_create(&eq->q, 1, ascending_timeout_data_cmp);
+    return pqueue_create(&eq->q, grow_size, ascending_timeout_data_cmp);
 }
 
 struct timeval *eventq_get_event_timeout(eventq_t *eq, struct timeval *timeout_ptr)

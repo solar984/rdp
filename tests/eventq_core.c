@@ -86,8 +86,8 @@ static void test_create_and_comparator(void)
     assert(eventq_create(&eq, 37) == 0);
     assert(eq.q.array != NULL);
     assert(eq.q.next_element == 0);
-    assert(eq.q.array_size == 1);
-    assert(eq.q.grow_size == 1);
+    assert(eq.q.array_size == 37);
+    assert(eq.q.grow_size == 37);
     assert(eq.q.keycmp != NULL);
 #ifdef _WIN32
 #ifdef RDPLIB_DEBUG
@@ -135,8 +135,8 @@ static void test_connection_helpers(void)
     assert(eventq_insert(&eq, &second) == 0);
     assert(eventq_insert(&eq, &infinite) == 0);
     assert(eq.q.next_element == 3);
-    assert(eq.q.array_size == 3);
-    assert(eq.q.grow_size == 1);
+    assert(eq.q.array_size == 99);
+    assert(eq.q.grow_size == 99);
     assert(eventq_peek_head(&eq) == &second);
 
     first.cn_event_time.time = 50;

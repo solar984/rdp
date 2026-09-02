@@ -119,15 +119,15 @@ static void test_create_allocation_failure(void)
     eventq_init(&eq);
     malloc_fails = 1;
 
-    assert(eventq_create(&eq, 37) == 1);
+    assert(eventq_create(&eq, 4) == 1);
     assert(malloc_calls == 1);
-    assert(malloc_size == sizeof(qlink *));
+    assert(malloc_size == 4 * sizeof(qlink *));
     assert(realloc_calls == 0);
     assert(free_calls == 0);
     assert(eq.q.array == NULL);
     assert(eq.q.next_element == 0);
-    assert(eq.q.array_size == 1);
-    assert(eq.q.grow_size == 1);
+    assert(eq.q.array_size == 4);
+    assert(eq.q.grow_size == 4);
     assert(eq.q.keycmp == ascending_timeout_data_cmp);
 #ifdef _WIN32
 #ifdef RDPLIB_DEBUG
@@ -152,10 +152,10 @@ static void test_deterministic_timeout_paths(void)
 
     reset_seams();
     eventq_init(&eq);
-    assert(eventq_create(&eq, UINT32_MAX) == 0);
+    assert(eventq_create(&eq, 4) == 0);
     assert(malloc_calls == 1);
-    assert(malloc_size == sizeof(qlink *));
-    assert(eq.q.grow_size == 1);
+    assert(malloc_size == 4 * sizeof(qlink *));
+    assert(eq.q.grow_size == 4);
 
     timeout.tv_sec = 123;
     timeout.tv_usec = 456;

@@ -716,6 +716,10 @@ uint32_t connection_close(connection_t *c, uint32_t linger_time, uint32_t *all_a
             }
             wait_to_signal = 0;
         }
+#ifndef RDPLIB_SOURCE_FAITHFUL
+        // Prevent a lookup that already holds a temporary reference from resuming protocol work.
+        c->cn_abort = 1;
+#endif
         rdp_connection_mark_for_delete(rdp, c);
     }
 

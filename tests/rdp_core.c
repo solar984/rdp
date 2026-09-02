@@ -700,6 +700,31 @@ static void test_resort_latches_failed_wake(void)
 }
 
 #ifndef RDPLIB_TEST_SOURCE_FAITHFUL
+static void test_immediate_close_rejects_pending_lookup(void)
+{
+    connection_fixture_t fixture;
+    connection_t *connection;
+
+    connection_fixture_init(&fixture);
+    connection = fixture.connection;
+
+    // Model an address lookup that took its temporary reference before close and is waiting for the connection lock.
+    assert(fixture.owner.owner.addr_map.table_size == 1);
+    umutex_lock(&fixture.owner.owner.addr_map.table[0].lock);
+    ++connection->cn_ref_count;
+    umutex_unlock(&fixture.owner.owner.addr_map.table[0].lock);
+
+    assert(connection_close(connection, 0, NULL, NULL) == RDP_CONNECTION_SEND_OK);
+    assert(connection->cn_abort == 1);
+    assert(rdp_lock_addr(&fixture.owner.owner, (struct sockaddr *)&fixture.remote_addr) == NULL);
+
+    umutex_lock(&connection->cn_lock);
+    fixture.connection = NULL;
+    rdp_unlock(connection);
+    assert(eventq_peek_head(&fixture.owner.owner.conn_eventq) == NULL);
+    connection_fixture_destroy(&fixture);
+}
+
 static void test_rejected_parser_full_path(void)
 {
     connection_fixture_t fixture;
@@ -766,6 +791,7 @@ int main(void)
     test_mark_delete_ownership();
     test_resort_latches_failed_wake();
 #ifndef RDPLIB_TEST_SOURCE_FAITHFUL
+    test_immediate_close_rejects_pending_lookup();
     test_rejected_parser_full_path();
 #endif
 #ifdef RDP_DEAD_CODE

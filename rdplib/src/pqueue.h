@@ -1,4 +1,4 @@
-// Copyright (c) 2026 solar@heliacal.net
+// Copyright (c) 2026 solar
 // SPDX-License-Identifier: MIT
 
 // Non owning intrusive priority queue used by RDP.

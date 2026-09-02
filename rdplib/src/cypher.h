@@ -1,4 +1,4 @@
-// Copyright (c) 2026 solar@heliacal.net
+// Copyright (c) 2026 solar
 // SPDX-License-Identifier: MIT
 
 // Block transformation used around connected RDP datagrams.

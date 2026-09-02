@@ -1,4 +1,4 @@
-// Copyright (c) 2026 solar@heliacal.net
+// Copyright (c) 2026 solar
 // SPDX-License-Identifier: MIT
 
 // bitarray_t stores 4096 bits followed by a zero dword; copies may read the following byte, and scans use it as a zero sentinel.

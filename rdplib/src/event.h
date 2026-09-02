@@ -1,4 +1,4 @@
-// Copyright (c) 2026 solar@heliacal.net
+// Copyright (c) 2026 solar
 // SPDX-License-Identifier: MIT
 
 // Absolute event deadline used as the event queue key.

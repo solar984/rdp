@@ -1,4 +1,4 @@
-// Copyright (c) 2026 solar@heliacal.net
+// Copyright (c) 2026 solar
 // SPDX-License-Identifier: MIT
 
 // Wrap aware fixed width comparators. Ordering is valid when keys are separated by less than half of their type's range.

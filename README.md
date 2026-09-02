@@ -1,6 +1,6 @@
 # rdplib
 
-[solar@heliacal.net](mailto:solar@heliacal.net)
+[solar@takp.info](mailto:solar@takp.info)
 
 `rdplib` is a standalone C11 reconstruction of the reliable UDP transport used by EverQuest/EQMac and some other old video games.
 

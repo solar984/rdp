@@ -1,4 +1,4 @@
-// Copyright (c) 2026 solar@heliacal.net
+// Copyright (c) 2026 solar
 // SPDX-License-Identifier: MIT
 
 // Raw connection snapshots filled by connection_get_perf_stats and connection_get_disconnect_info.

@@ -56,6 +56,12 @@ add_executable(rdplib_api api.c)
 target_link_libraries(rdplib_api PRIVATE rdplib Threads::Threads)
 add_test(NAME rdplib_api COMMAND rdplib_api)
 
+add_executable(rdplib_facade_owner_core facade_owner_core.c)
+target_include_directories(rdplib_facade_owner_core PRIVATE ../rdplib/src)
+target_link_libraries(rdplib_facade_owner_core PRIVATE rdplib)
+add_test(NAME rdplib_facade_owner_core COMMAND rdplib_facade_owner_core)
+set_tests_properties(rdplib_facade_owner_core PROPERTIES TIMEOUT 10)
+
 add_executable(rdplib_multi_sender_api multi_sender_api.c)
 target_link_libraries(rdplib_multi_sender_api PRIVATE rdplib Threads::Threads)
 add_test(NAME rdplib_multi_sender_api COMMAND rdplib_multi_sender_api)

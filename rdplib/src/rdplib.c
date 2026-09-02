@@ -1,4 +1,4 @@
-// Copyright (c) 2026 solar@heliacal.net
+// Copyright (c) 2026 solar
 // SPDX-License-Identifier: MIT
 
 #include "rdplib.h"
@@ -33,7 +33,6 @@ struct rdplib_message_t
 
 struct rdplib_connection_t
 {
-    struct rdplib_connection_t *all_next;
     struct rdplib_connection_t *accept_next;
     rdplib_endpoint_t *endpoint;
     connection_t *raw;
@@ -52,7 +51,6 @@ struct rdplib_endpoint_t
     rdplib_runtime_t *runtime;
     rdp_t *raw;
     uint32_t application_connection_count;
-    rdplib_connection_t *connections;
     rdplib_connection_t *accept_head;
     rdplib_connection_t *accept_tail;
     rdplib_message_t *connectionless_head;
@@ -80,6 +78,8 @@ static void rdplib_connection_destroy_handle(rdplib_connection_t *connection)
 {
     assert(connection->raw == NULL);
     assert(connection->message_head == NULL);
+    assert(connection->message_tail == NULL);
+    assert(connection->accept_next == NULL);
     assert(connection->endpoint == NULL);
     assert(!connection->application_owned);
     rdplib_platform_mutex_destroy(&connection->send_lock);
@@ -98,24 +98,40 @@ static void rdplib_connection_clear_packet_drop_callback(connection_t *raw)
 #endif
 }
 
-static void rdplib_endpoint_remove_connection(rdplib_endpoint_t *endpoint, rdplib_connection_t *connection)
+static rdplib_connection_t *rdplib_connection_from_raw(connection_t *raw)
 {
-    rdplib_connection_t **link = &endpoint->connections;
+    rdplib_connection_t *connection;
 
-    while (*link && *link != connection)
+    assert(raw != NULL);
+    connection = (rdplib_connection_t *)connection_app_ptr(raw)[0];
+    assert(!connection || connection->raw == raw);
+    return connection;
+}
+
+static void rdplib_connection_attach_raw(rdplib_connection_t *connection, connection_t *raw)
+{
+    assert(connection != NULL);
+    assert(raw != NULL);
+    assert(connection->raw == NULL);
+    assert(connection_app_ptr(raw)[0] == NULL);
+
+    connection->raw = raw;
+    connection_app_ptr(raw)[0] = connection;
+}
+
+static connection_t *rdplib_connection_detach_raw(rdplib_connection_t *connection)
+{
+    connection_t *raw;
+
+    assert(connection != NULL);
+    raw = connection->raw;
+    if (raw)
     {
-        link = &(*link)->all_next;
+        assert(connection_app_ptr(raw)[0] == connection);
+        connection_app_ptr(raw)[0] = NULL;
+        connection->raw = NULL;
     }
-
-    // Every application owned connection remains linked to its endpoint until release.
-    assert(*link != NULL);
-    if (!*link)
-    {
-        return;
-    }
-
-    *link = connection->all_next;
-    connection->all_next = NULL;
+    return raw;
 }
 
 void rdplib_connection_release(rdplib_connection_t *connection)
@@ -136,7 +152,7 @@ void rdplib_connection_release(rdplib_connection_t *connection)
 
     rdplib_platform_mutex_lock(&connection->send_lock);
     assert(!connection->raw || connection->close_started || connection->peer_fin || connection->disconnected);
-    raw = connection->raw;
+    raw = rdplib_connection_detach_raw(connection);
     if (raw)
     {
         // A terminal peer state permits release without a prior explicit close.
@@ -144,29 +160,13 @@ void rdplib_connection_release(rdplib_connection_t *connection)
         connection->close_started = 1;
         rdplib_connection_clear_packet_drop_callback(raw);
         (void)connection_close(raw, 0, NULL, NULL);
-        connection->raw = NULL;
     }
     rdplib_platform_mutex_unlock(&connection->send_lock);
 
-    rdplib_endpoint_remove_connection(endpoint, connection);
     --endpoint->application_connection_count;
     connection->application_owned = 0;
     connection->endpoint = NULL;
     rdplib_connection_destroy_handle(connection);
-}
-
-static rdplib_connection_t *rdplib_find_connection(rdplib_endpoint_t *endpoint, connection_t *raw)
-{
-    rdplib_connection_t *connection;
-
-    for (connection = endpoint->connections; connection; connection = connection->all_next)
-    {
-        if (connection->raw == raw)
-        {
-            return connection;
-        }
-    }
-    return NULL;
 }
 
 static rdplib_connection_t *rdplib_create_connection_handle(rdplib_endpoint_t *endpoint, connection_t *borrowed, int accept_pending)
@@ -188,11 +188,9 @@ static rdplib_connection_t *rdplib_create_connection_handle(rdplib_endpoint_t *e
     rdplib_platform_mutex_prepare(&connection->send_lock);
     rdplib_platform_mutex_init(&connection->send_lock);
     connection->endpoint = endpoint;
-    connection->raw = borrowed;
     connection->application_owned = (uint8_t)(accept_pending == 0);
     memcpy(connection->remote_address, &borrowed->tx_remote_addr, sizeof(connection->remote_address));
-    connection->all_next = endpoint->connections;
-    endpoint->connections = connection;
+    rdplib_connection_attach_raw(connection, borrowed);
 
     if (!accept_pending)
     {
@@ -296,7 +294,8 @@ static int rdplib_process_arrival(rdplib_endpoint_t *endpoint, msg_arrival_t *ar
     {
         int create_for_arrival = arrival->size != 0 || (arrival->options & RDP_FLAG_FIN) != 0;
 
-        connection = rdplib_find_connection(endpoint, raw);
+        connection = rdplib_connection_from_raw(raw);
+        assert(!connection || connection->endpoint == endpoint);
         if (!connection && create_for_arrival)
         {
             connection = rdplib_create_connection_handle(endpoint, raw, 1);
@@ -443,7 +442,7 @@ static void rdplib_detach_connection(rdplib_connection_t *connection)
     rdplib_message_t *next;
 
     assert(!connection->application_owned);
-    connection->raw = NULL;
+    (void)rdplib_connection_detach_raw(connection);
     connection->endpoint = NULL;
     message = connection->message_head;
     connection->message_head = NULL;
@@ -461,7 +460,6 @@ static void rdplib_detach_connection(rdplib_connection_t *connection)
 int rdplib_endpoint_destroy(rdplib_endpoint_t *endpoint)
 {
     rdplib_connection_t *connection;
-    rdplib_connection_t *next_connection;
     rdplib_message_t *message;
     rdplib_message_t *next_message;
     rdplib_runtime_t *runtime;
@@ -476,16 +474,14 @@ int rdplib_endpoint_destroy(rdplib_endpoint_t *endpoint)
     }
 
     runtime = endpoint->runtime;
-    endpoint->accept_head = NULL;
-    endpoint->accept_tail = NULL;
-    for (connection = endpoint->connections; connection; connection = next_connection)
+    assert((endpoint->accept_head == NULL) == (endpoint->accept_tail == NULL));
+    while ((connection = endpoint->accept_head) != NULL)
     {
-        next_connection = connection->all_next;
-        connection->all_next = NULL;
+        endpoint->accept_head = connection->accept_next;
         connection->accept_next = NULL;
         rdplib_detach_connection(connection);
     }
-    endpoint->connections = NULL;
+    endpoint->accept_tail = NULL;
 
     for (message = endpoint->connectionless_head; message; message = next_message)
     {
@@ -852,11 +848,10 @@ int rdplib_connection_begin_close(rdplib_connection_t *connection, uint32_t ling
         }
         else
         {
-            raw = connection->raw;
             connection->close_started = 1;
+            raw = rdplib_connection_detach_raw(connection);
             rdplib_connection_clear_packet_drop_callback(raw);
             result = connection_close(raw, linger_timeout_ms, NULL, NULL);
-            connection->raw = NULL;
         }
     }
     rdplib_platform_mutex_unlock(&connection->send_lock);

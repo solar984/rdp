@@ -97,6 +97,10 @@ typedef struct rdp_t
     uint32_t encrypt;
     uint32_t crc;
     serial_t serial;
+#ifndef RDPLIB_SOURCE_FAITHFUL
+    void (*rdplib_arrival_ready_callback)(void *context);
+    void *rdplib_arrival_ready_context;
+#endif
 } rdp_t;
 
 #if defined(_WIN32) && !defined(_WIN64)
@@ -129,7 +133,13 @@ RDP_ASSERT_OFFSET(rdp_t, duplicate_bytes_per_second, 0x10C + 3u * RDP_WIN32_UMUT
 RDP_ASSERT_OFFSET(rdp_t, encrypt, 0x110 + 3u * RDP_WIN32_UMUTEX_OWNER_BYTES);
 RDP_ASSERT_OFFSET(rdp_t, crc, 0x114 + 3u * RDP_WIN32_UMUTEX_OWNER_BYTES);
 RDP_ASSERT_OFFSET(rdp_t, serial, 0x118 + 3u * RDP_WIN32_UMUTEX_OWNER_BYTES);
+#ifdef RDPLIB_SOURCE_FAITHFUL
 RDP_STATIC_ASSERT(sizeof(rdp_t) == 0x1AC + 4u * RDP_WIN32_UMUTEX_OWNER_BYTES, "rdp_t has the expected Win32 layout");
+#else
+RDP_ASSERT_OFFSET(rdp_t, rdplib_arrival_ready_callback, 0x1AC + 4u * RDP_WIN32_UMUTEX_OWNER_BYTES);
+RDP_ASSERT_OFFSET(rdp_t, rdplib_arrival_ready_context, 0x1B0 + 4u * RDP_WIN32_UMUTEX_OWNER_BYTES);
+RDP_STATIC_ASSERT(sizeof(rdp_t) == 0x1B4 + 4u * RDP_WIN32_UMUTEX_OWNER_BYTES, "rdp_t has the expected maintained Win32 layout");
+#endif
 #endif
 
 extern uint16_t g_next_local_port;

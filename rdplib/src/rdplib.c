@@ -422,7 +422,7 @@ int rdplib_endpoint_create_ex(rdplib_runtime_t *runtime, rdplib_endpoint_t **out
     memset(endpoint, 0, sizeof(*endpoint));
     endpoint->runtime = runtime;
 
-    result = (int)rdplib_rdp_create(&endpoint->raw, local_port, expected_connections, flags | RDP_CREATE_REQUIRE_IPV4, receive_socket_buffer_bytes, send_socket_buffer_bytes);
+    result = (int)rdplib_rdp_create(&endpoint->raw, local_port, expected_connections, flags | RDP_CREATE_REQUIRE_IPV4, receive_socket_buffer_bytes, send_socket_buffer_bytes, NULL, NULL);
     if (result != 0)
     {
         rdplib_platform_free(endpoint);

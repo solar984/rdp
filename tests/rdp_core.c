@@ -36,6 +36,10 @@ _Static_assert(offsetof(rdp_t, io_thread) > offsetof(rdp_t, io_thread_running), 
 _Static_assert(offsetof(rdp_t, message_rxq) > offsetof(rdp_t, receive_semaphore), "rdp_t receive queue order changed");
 _Static_assert(offsetof(rdp_t, external_rxq) > offsetof(rdp_t, message_rxq_mutex), "rdp_t external queue order changed");
 _Static_assert(offsetof(rdp_t, serial) > offsetof(rdp_t, crc), "rdp_t serial tail changed");
+#ifndef RDPLIB_TEST_SOURCE_FAITHFUL
+_Static_assert(offsetof(rdp_t, rdplib_arrival_ready_callback) > offsetof(rdp_t, serial), "rdp_t arrival callback moved before recovered fields");
+_Static_assert(offsetof(rdp_t, rdplib_arrival_ready_context) > offsetof(rdp_t, rdplib_arrival_ready_callback), "rdp_t arrival callback context order changed");
+#endif
 
 #if defined(_WIN32) && UINTPTR_MAX == UINT32_MAX
 _Static_assert(sizeof(uthread_t) == 0x10, "uthread_t x86 size");
@@ -44,7 +48,11 @@ _Static_assert(offsetof(uthread_t, id) == 0x04, "uthread_t::id x86 offset");
 _Static_assert(offsetof(uthread_t, proc) == 0x08, "uthread_t::proc x86 offset");
 _Static_assert(offsetof(uthread_t, data) == 0x0c, "uthread_t::data x86 offset");
 
+#ifdef RDPLIB_TEST_SOURCE_FAITHFUL
 _Static_assert(sizeof(rdp_t) == 0x1ac + 4u * RDP_WIN32_UMUTEX_OWNER_BYTES, "rdp_t x86 size");
+#else
+_Static_assert(sizeof(rdp_t) == 0x1b4 + 4u * RDP_WIN32_UMUTEX_OWNER_BYTES, "rdp_t maintained x86 size");
+#endif
 _Static_assert(offsetof(rdp_t, startup) == 0x000, "rdp_t::startup x86 offset");
 _Static_assert(offsetof(rdp_t, udp_socket) == 0x004, "rdp_t::udp_socket x86 offset");
 _Static_assert(offsetof(rdp_t, icmp_socket) == 0x008, "rdp_t::icmp_socket x86 offset");
@@ -75,6 +83,10 @@ _Static_assert(offsetof(rdp_t, duplicate_bytes_per_second) == 0x10c + 3u * RDP_W
 _Static_assert(offsetof(rdp_t, encrypt) == 0x110 + 3u * RDP_WIN32_UMUTEX_OWNER_BYTES, "rdp_t::encrypt x86 offset");
 _Static_assert(offsetof(rdp_t, crc) == 0x114 + 3u * RDP_WIN32_UMUTEX_OWNER_BYTES, "rdp_t::crc x86 offset");
 _Static_assert(offsetof(rdp_t, serial) == 0x118 + 3u * RDP_WIN32_UMUTEX_OWNER_BYTES, "rdp_t::serial x86 offset");
+#ifndef RDPLIB_TEST_SOURCE_FAITHFUL
+_Static_assert(offsetof(rdp_t, rdplib_arrival_ready_callback) == 0x1ac + 4u * RDP_WIN32_UMUTEX_OWNER_BYTES, "rdp_t::rdplib_arrival_ready_callback x86 offset");
+_Static_assert(offsetof(rdp_t, rdplib_arrival_ready_context) == 0x1b0 + 4u * RDP_WIN32_UMUTEX_OWNER_BYTES, "rdp_t::rdplib_arrival_ready_context x86 offset");
+#endif
 #endif
 
 _Static_assert(_Generic(&g_next_local_port, uint16_t *: 1, default: 0), "g_next_local_port type");
@@ -95,6 +107,9 @@ _Static_assert(_Generic(&rdp_io_thread, void (*)(void *): 1, default: 0), "rdp_i
 _Static_assert(_Generic(&rdp_enqueue_disconnect_msg, void (*)(rdp_t *, connection_t *): 1, default: 0), "rdp_enqueue_disconnect_msg signature");
 _Static_assert(_Generic(&rdp_init, void (*)(rdp_t *): 1, default: 0), "rdp_init signature");
 _Static_assert(_Generic(&rdp_create, uint32_t (*)(rdp_t **, uint16_t, uint32_t, uint32_t): 1, default: 0), "rdp_create signature");
+_Static_assert(_Generic(&rdplib_rdp_create,
+                       uint32_t (*)(rdp_t **, uint16_t, uint32_t, uint32_t, uint32_t, uint32_t, rdplib_rdp_arrival_ready_callback_t, void *): 1, default: 0),
+               "rdplib_rdp_create signature");
 _Static_assert(_Generic(&rdp_destroy, void (*)(rdp_t *, int): 1, default: 0), "rdp_destroy signature");
 _Static_assert(_Generic(&rdp_connect_sa, uint32_t (*)(rdp_t *, connection_t **, struct sockaddr *, uint32_t): 1, default: 0), "rdp_connect_sa signature");
 #if defined(RDPLIB_DEBUG) || defined(RDPLIB_SOURCE_FAITHFUL)
@@ -143,6 +158,24 @@ typedef struct connection_fixture_t
     connection_t *connection;
     struct sockaddr_in remote_addr;
 } connection_fixture_t;
+
+#ifndef RDPLIB_TEST_SOURCE_FAITHFUL
+typedef struct arrival_ready_capture_t
+{
+    rdp_t *owner;
+    uint32_t callback_count;
+} arrival_ready_capture_t;
+
+static void capture_arrival_ready(void *context)
+{
+    arrival_ready_capture_t *capture = (arrival_ready_capture_t *)context;
+
+    umutex_lock(&capture->owner->message_rxq_mutex);
+    assert(rxq_peek_head(&capture->owner->message_rxq) != NULL);
+    umutex_unlock(&capture->owner->message_rxq_mutex);
+    ++capture->callback_count;
+}
+#endif
 
 static rdp_stat test_statistics;
 
@@ -326,6 +359,9 @@ static void test_init_selectivity(void)
     assert(owner.encrypt == UINT32_C(0xa5a5a5a5) && owner.crc == UINT32_C(0xa5a5a5a5));
     assert((int32_t)(owner.last_sample - before) >= 0 && (int32_t)(after - owner.last_sample) >= 0);
     assert((intptr_t)owner.serial.file == -1 && owner.serial.rx_state == 0);
+#ifndef RDPLIB_TEST_SOURCE_FAITHFUL
+    assert(owner.rdplib_arrival_ready_callback == NULL && owner.rdplib_arrival_ready_context == NULL);
+#endif
 
     rxq_destroy(&owner.message_rxq);
     rxq_destroy(&owner.external_rxq);
@@ -365,6 +401,30 @@ static void test_create_consumes_local_ports(void)
     rdp_destroy(first, 1);
     g_next_local_port = saved;
 }
+
+static void test_create_installs_arrival_callback(void)
+{
+    arrival_ready_capture_t capture;
+    msg_arrival_t *arrival;
+    rdp_t *owner = NULL;
+    uint16_t saved = g_next_local_port;
+
+    memset(&capture, 0, sizeof(capture));
+    assert(rdplib_rdp_create(&owner, 0, 1, 0, 0, 0, capture_arrival_ready, &capture) == RDP_CREATE_OK);
+    assert(owner != NULL);
+    capture.owner = owner;
+    assert(owner->rdplib_arrival_ready_callback == capture_arrival_ready);
+    assert(owner->rdplib_arrival_ready_context == &capture);
+
+    rdp_enqueue_arrival(owner, make_arrival(NULL, 0, 1, 0, 0));
+    assert(capture.callback_count == 1);
+    arrival = rdp_receive(owner, 0);
+    assert(arrival != NULL);
+    fast_free(arrival);
+
+    rdp_destroy(owner, 1);
+    g_next_local_port = saved;
+}
 #endif
 
 static void test_crc_and_decode(void)
@@ -402,10 +462,20 @@ static void test_arrival_fifo_signal_and_receive(void)
     connection_t closed_sender;
     msg_arrival_t *first;
     msg_arrival_t *second;
+    msg_arrival_t *third;
     msg_arrival_t *received;
     uint32_t before;
+#ifndef RDPLIB_TEST_SOURCE_FAITHFUL
+    arrival_ready_capture_t arrival_ready;
+#endif
 
     owner_fixture_init(&fixture);
+#ifndef RDPLIB_TEST_SOURCE_FAITHFUL
+    arrival_ready.owner = &fixture.owner;
+    arrival_ready.callback_count = 0;
+    fixture.owner.rdplib_arrival_ready_callback = capture_arrival_ready;
+    fixture.owner.rdplib_arrival_ready_context = &arrival_ready;
+#endif
     first = make_arrival(NULL, 0, 11, 0, 0);
     second = make_arrival(NULL, 0, 12, 0, 0);
     first->enqueue_time = UINT32_C(0xa5a5a5a5);
@@ -418,6 +488,9 @@ static void test_arrival_fifo_signal_and_receive(void)
     assert(first->enqueue_time == UINT32_C(0xa5a5a5a5) && second->enqueue_time == UINT32_C(0x5a5a5a5a));
 #endif
     assert(fixture.owner.message_rxq.list.size == 2);
+#ifndef RDPLIB_TEST_SOURCE_FAITHFUL
+    assert(arrival_ready.callback_count == 1);
+#endif
     assert(usemaphore_decrement(&fixture.owner.receive_semaphore, 0));
     assert(!usemaphore_decrement(&fixture.owner.receive_semaphore, 0)); // Only the empty to nonempty transition signals.
     assert(rxq_remove_head(&fixture.owner.message_rxq) == first);
@@ -427,14 +500,25 @@ static void test_arrival_fifo_signal_and_receive(void)
 
     first = make_arrival(NULL, 0, 21, 0, 0);
     second = make_arrival(NULL, 0, 22, 0, 0);
+    third = make_arrival(NULL, 0, 23, 0, 0);
     rdp_enqueue_arrival(&fixture.owner, first);
     rdp_enqueue_arrival(&fixture.owner, second);
+#ifndef RDPLIB_TEST_SOURCE_FAITHFUL
+    assert(arrival_ready.callback_count == 2);
+#endif
     received = rdp_receive(&fixture.owner, 0);
     assert(received == first);
     assert(fixture.owner.message_rxq.list.size == 0 && fixture.owner.external_rxq.list.size == 1);
     fast_free(received);
+    rdp_enqueue_arrival(&fixture.owner, third);
+#ifndef RDPLIB_TEST_SOURCE_FAITHFUL
+    assert(arrival_ready.callback_count == 3);
+#endif
     received = rdp_receive(&fixture.owner, 0);
     assert(received == second);
+    fast_free(received);
+    received = rdp_receive(&fixture.owner, 0);
+    assert(received == third);
     fast_free(received);
     assert(rdp_receive(&fixture.owner, 0) == NULL);
     before = time_get_ms();
@@ -447,8 +531,11 @@ static void test_arrival_fifo_signal_and_receive(void)
     memset(&closed_sender, 0, sizeof(closed_sender));
     closed_sender.cn_rdp = &fixture.owner;
     closed_sender.cn_closed = 1;
-    rdp_enqueue_arrival(&fixture.owner, make_arrival(&closed_sender, 0, 23, 0, 0));
+    rdp_enqueue_arrival(&fixture.owner, make_arrival(&closed_sender, 0, 24, 0, 0));
     assert(fixture.owner.message_rxq.list.size == 0 && fixture.owner.external_rxq.list.size == 0);
+#ifndef RDPLIB_TEST_SOURCE_FAITHFUL
+    assert(arrival_ready.callback_count == 3);
+#endif
     owner_fixture_destroy(&fixture);
 }
 
@@ -779,6 +866,7 @@ int main(void)
     test_local_port_global();
 #ifndef RDPLIB_TEST_SOURCE_FAITHFUL
     test_create_consumes_local_ports();
+    test_create_installs_arrival_callback();
 #endif
     test_init_selectivity();
     test_crc_and_decode();

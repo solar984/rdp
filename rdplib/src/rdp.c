@@ -215,6 +215,10 @@ int rdplib_rdp_get_socket_send_buffer_size(const rdp_t *rdp, uint32_t *bytes)
 
 void rdp_enqueue_arrival(rdp_t *rdp, msg_arrival_t *arrival)
 {
+#ifndef RDPLIB_SOURCE_FAITHFUL
+    rdplib_rdp_arrival_ready_callback_t arrival_ready_callback = NULL;
+    void *arrival_ready_context = NULL;
+#endif
 #ifdef RDPLIB_DEBUG
     assert(( arrival->sender == NULL ) || ( arrival->sender->cn_rdp == rdp ));
 #endif
@@ -241,8 +245,18 @@ void rdp_enqueue_arrival(rdp_t *rdp, msg_arrival_t *arrival)
         if (!queue_head)
         {
             usemaphore_increment(&rdp->receive_semaphore);
+#ifndef RDPLIB_SOURCE_FAITHFUL
+            arrival_ready_callback = rdp->rdplib_arrival_ready_callback;
+            arrival_ready_context = rdp->rdplib_arrival_ready_context;
+#endif
         }
         umutex_unlock(&rdp->message_rxq_mutex);
+#ifndef RDPLIB_SOURCE_FAITHFUL
+        if (arrival_ready_callback)
+        {
+            arrival_ready_callback(arrival_ready_context);
+        }
+#endif
     }
 }
 
@@ -1164,21 +1178,28 @@ void rdp_init(rdp_t *rdp)
     rxq_init(&rdp->external_rxq);
     umutex_create(&rdp->external_rxq_mutex);
     rdp->last_sample = time_get_ms();
+#ifndef RDPLIB_SOURCE_FAITHFUL
+    rdp->rdplib_arrival_ready_callback = NULL;
+    rdp->rdplib_arrival_ready_context = NULL;
+#endif
 }
 
-static uint32_t rdp_create_internal(rdp_t **out_rdp, uint16_t local_port, uint32_t connections, uint32_t flags, uint32_t receive_socket_buffer_bytes, uint32_t send_socket_buffer_bytes);
+static uint32_t rdp_create_internal(rdp_t **out_rdp, uint16_t local_port, uint32_t connections, uint32_t flags, uint32_t receive_socket_buffer_bytes, uint32_t send_socket_buffer_bytes,
+                                    rdplib_rdp_arrival_ready_callback_t arrival_ready_callback, void *arrival_ready_context);
 
 uint32_t rdp_create(rdp_t **out_rdp, uint16_t local_port, uint32_t connections, uint32_t flags)
 {
-    return rdp_create_internal(out_rdp, local_port, connections, flags, 0, 0);
+    return rdp_create_internal(out_rdp, local_port, connections, flags, 0, 0, NULL, NULL);
 }
 
-uint32_t rdplib_rdp_create(rdp_t **out_rdp, uint16_t local_port, uint32_t connections, uint32_t flags, uint32_t receive_socket_buffer_bytes, uint32_t send_socket_buffer_bytes)
+uint32_t rdplib_rdp_create(rdp_t **out_rdp, uint16_t local_port, uint32_t connections, uint32_t flags, uint32_t receive_socket_buffer_bytes, uint32_t send_socket_buffer_bytes,
+                           rdplib_rdp_arrival_ready_callback_t arrival_ready_callback, void *arrival_ready_context)
 {
-    return rdp_create_internal(out_rdp, local_port, connections, flags, receive_socket_buffer_bytes, send_socket_buffer_bytes);
+    return rdp_create_internal(out_rdp, local_port, connections, flags, receive_socket_buffer_bytes, send_socket_buffer_bytes, arrival_ready_callback, arrival_ready_context);
 }
 
-static uint32_t rdp_create_internal(rdp_t **out_rdp, uint16_t local_port, uint32_t connections, uint32_t flags, uint32_t receive_socket_buffer_bytes, uint32_t send_socket_buffer_bytes)
+static uint32_t rdp_create_internal(rdp_t **out_rdp, uint16_t local_port, uint32_t connections, uint32_t flags, uint32_t receive_socket_buffer_bytes, uint32_t send_socket_buffer_bytes,
+                                    rdplib_rdp_arrival_ready_callback_t arrival_ready_callback, void *arrival_ready_context)
 {
     rdp_t *rdp;
     uint32_t namelen;
@@ -1200,12 +1221,23 @@ static uint32_t rdp_create_internal(rdp_t **out_rdp, uint16_t local_port, uint32
 
     result = 0;
     *out_rdp = NULL;
+#ifdef RDPLIB_SOURCE_FAITHFUL
+    if (arrival_ready_callback)
+    {
+        return RDP_CREATE_FAILED;
+    }
+    (void)arrival_ready_context;
+#endif
     rdp = (rdp_t *)rdplib_platform_malloc(sizeof(*rdp));
     if (!rdp)
     {
         return 2;
     }
     rdp_init(rdp);
+#ifndef RDPLIB_SOURCE_FAITHFUL
+    rdp->rdplib_arrival_ready_callback = arrival_ready_callback;
+    rdp->rdplib_arrival_ready_context = arrival_ready_context;
+#endif
 
     ver = UINT16_C(0x0101);
     err = rdplib_platform_network_startup(ver);
